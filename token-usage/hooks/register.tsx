@@ -3,12 +3,45 @@ import type { Register } from 'claude-code'
 
 import type { Snap, Win } from '../types'
 
-const EMPTY: Snap = { five: null, seven: null, usd: null, tokIn: 0, tokOut: 0, tokCache: 0 }
+const EMPTY: Snap = { five: null, seven: null, usd: null, tokIn: 0, tokWrite: 0, tokOut: 0, tokCache: 0, sid: null, startedAt: null, since: null }
 const snap = atom({ plugin: 'token-usage', key: 'snap' } as const, EMPTY)
 
 const tick = atom({ plugin: 'token-usage', key: 'tick' } as const, 0)
 
 const H = 3600_000
+
+// ---- token counting ----
+// The engine's cost (session.measure e.cost.usd, the same figure as /cost) sums every priced API
+// response of the session. Count tokens the same way: once per API response. turn.complete's usage
+// only carried the last response of a turn here (2026-10-14: this band showed 37.9M cache reads /
+// 54k output where the transcript held 140.9M / 344k for the same $52), so turn.step is the source;
+// turn.complete is the fallback for a turn none of whose steps reported usage.
+type U = { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }
+const add = ($: any, u: U) =>
+  update($, snap, v => ({
+    ...v,
+    tokIn: v.tokIn + (u.input_tokens ?? 0),
+    tokWrite: v.tokWrite + (u.cache_creation_input_tokens ?? 0),
+    tokOut: v.tokOut + (u.output_tokens ?? 0),
+    tokCache: v.tokCache + (u.cache_read_input_tokens ?? 0),
+  }))
+// turns whose steps were counted; a module variable, so a reload mid-turn at worst falls back for that turn
+const stepped = new Set<string>()
+
+// counters persist per session in $.store, so a restart or resume of the same session restores them
+const KEEP = 30
+const SKEY = 'sess:'
+const persist = async ($: any) => {
+  const v = await read($, snap)
+  if (!v.sid) return
+  await $.store.set(SKEY + v.sid, { tokIn: v.tokIn, tokWrite: v.tokWrite, tokOut: v.tokOut, tokCache: v.tokCache, startedAt: v.startedAt, since: v.since })
+  const old = ((await $.store.keys()) as string[]).filter(x => x.startsWith(SKEY) && x !== SKEY + v.sid)
+  for (const x of old.slice(0, Math.max(0, old.length - KEEP))) await $.store.delete(x)
+}
+const hhmm = (ms: number) => {
+  const d = new Date(ms)
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+}
 const k = (n: number) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : `${n}`)
 
 const left = (iso: string | undefined, now: number) => {
@@ -112,10 +145,11 @@ const strip = (v: Snap, now: number) => {
   }
   if (v.five) add(winPill(x, '5h', '5 小時工作階段額度', 'gauge', v.five, 5 * H, now, '#22C55E', '#4ADE80'))
   if (v.seven) add(winPill(x, '7d', '7 天每週額度', 'cal', v.seven, 7 * 24 * H, now, '#8B5CF6', '#A78BFA'), 18)
-  add(chip(x, 'up', k(v.tokIn), '#F43F5E', '#FB7185', `輸入 token：本工作階段送給模型的內容共 ${k(v.tokIn)}`))
+  add(chip(x, 'up', k(v.tokIn + v.tokWrite), '#F43F5E', '#FB7185', `新輸入 token：${k(v.tokIn + v.tokWrite)}&#10;寫入快取 ${k(v.tokWrite)}（按輸入價 1.25～2 倍計）＋未快取輸入 ${k(v.tokIn)}（按輸入價計）`))
   add(chip(x, 'down', k(v.tokOut), '#10B981', '#34D399', `輸出 token：模型在本工作階段產生的內容共 ${k(v.tokOut)}`))
   add(chip(x, 'layers', k(v.tokCache), '#6366F1', '#818CF8', `快取讀取 token：從提示快取重複使用 ${k(v.tokCache)}，計費較一般輸入低`), 18)
-  if (v.usd !== null) add(chip(x, 'coin', `$${v.usd.toFixed(2)}`, '#F59E0B', '#FBBF24', `工作階段費用：依 API 牌價估算約 $${v.usd.toFixed(2)} 美元`))
+  const partial = v.since !== null && v.startedAt !== null && v.since - v.startedAt > 120_000
+  if (v.usd !== null) add(chip(x, 'coin', `$${v.usd.toFixed(2)}`, '#F59E0B', '#FBBF24', `工作階段費用：依 API 牌價約 $${v.usd.toFixed(2)} 美元（Claude Code 帳本，與 /cost 相同，含子代理與壓縮）` + (partial ? `&#10;token 計數自 ${hhmm(v.since!)} 起；此前的用量只算進金額` : '')))
   const w = Math.ceil(x - 8)
   return { w, svg: `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="28" viewBox="0 0 ${w} 28"><style>:root{color-scheme:light dark;background:transparent}.p{cursor:help}.p .h{transition:fill-opacity .12s}.p:hover .h{fill-opacity:.26}</style>${parts.join('')}</svg>` }
 }
@@ -124,7 +158,7 @@ const strip = (v: Snap, now: number) => {
 
 const bar = (w: Win, span: number, now: number) => {
   const n = 8
-  const cells = Array.from({ length: n }, (_, i) => (i < Math.round((w.used / 100) * n) ? '━' : '─'))
+  const cells: string[] = Array.from({ length: n }, (_, i) => (i < Math.round((w.used / 100) * n) ? '━' : '─'))
   if (w.resetsAt) {
     const el = 1 - (Date.parse(w.resetsAt) - now) / span
     cells[Math.min(n - 1, Math.max(0, Math.floor(el * n)))] = '┃'
@@ -136,7 +170,57 @@ export const register: Register = on => {
   // redraw every 5 min so the reset countdowns and time markers keep moving; no model call
   on('session.start', async ($, e, next) => {
     $.clock.every(5 * 60_000, () => update($, tick, n => n + 1))
+    // whose counters: same session and start → keep (a hot reload); else restore what this
+    // session saved (a restart or resume), else start over (a new session, a /clear)
+    try {
+      const sid = await $.session.id()
+      const { startedAt } = await $.session.usage()
+      const v = await read($, snap)
+      if (v.sid !== sid || v.startedAt !== startedAt) {
+        const saved = (await $.store.get(SKEY + sid)) as Partial<Snap> | undefined
+        const ok = !!saved && saved.startedAt === startedAt
+        const now = await $.clock.now()
+        await update($, snap, cur => ({
+          ...cur,
+          tokIn: ok ? saved!.tokIn ?? 0 : 0,
+          tokWrite: ok ? saved!.tokWrite ?? 0 : 0,
+          tokOut: ok ? saved!.tokOut ?? 0 : 0,
+          tokCache: ok ? saved!.tokCache ?? 0 : 0,
+          sid,
+          startedAt,
+          since: ok ? saved!.since ?? startedAt : Math.max(startedAt, now - 60_000),
+        }))
+      }
+    } catch {}
     return next(e)
+  })
+
+  // one count per API response, main loop and subagents alike
+  on('turn.step', async function* ($, e, next) {
+    const r = yield* next(e)
+    try {
+      if (r && r.usage) {
+        stepped.add(e.turnId)
+        await add($, r.usage)
+      }
+    } catch {}
+    return r
+  })
+
+  // the compaction's own request is priced in the session's cost but is no turn step
+  on('session.compact', async ($, e, next) => {
+    const r = await next(e)
+    if (r && 'usage' in r && r.usage) void add($, r.usage).then(() => persist($)).catch(() => {})
+    return r
+  })
+
+  // a plugin's own model calls ($.model.complete) are priced too
+  on('model.complete', async ($, e, next) => {
+    const r = await next(e)
+    // a call on $ answers { value } (or { deny }); the usage rides the value
+    const u = r && 'value' in r ? r.value?.usage : undefined
+    if (u) void add($, u).catch(() => {})
+    return r
   })
 
   on('session.measure', async ($, e, next) => {
@@ -152,15 +236,12 @@ export const register: Register = on => {
   })
 
   on('turn.complete', async ($, e, next) => {
-    const u = e.usage
-    if (u) {
-      await update($, snap, v => ({
-        ...v,
-        tokIn: v.tokIn + u.input_tokens + u.cache_creation_input_tokens,
-        tokOut: v.tokOut + u.output_tokens,
-        tokCache: v.tokCache + u.cache_read_input_tokens,
-      }))
-    }
+    try {
+      // fallback: a turn none of whose steps reported usage counts its own total once
+      if (e.usage && !stepped.has(e.turnId)) await add($, e.usage)
+      stepped.delete(e.turnId)
+      await persist($)
+    } catch {}
     return next(e)
   })
 
@@ -169,25 +250,32 @@ export const register: Register = on => {
     await read($, tick)
     const v = await read($, snap)
     const now = await $.clock.now()
-    const t = $.ui.resolve(e)
-    const { Box, Text } = t
+    const { Box, Text } = $.ui.resolve(e)
+    // AbovePrompt is one band shared by every plugin hooked on it. Answering without
+    // next() would hide whatever a plugin beneath draws there (e.g. cc-arcade's board
+    // while /arcade is open), so take what is beneath and draw our line under it.
+    const below = await next(e)
+    const stack = (own: ReturnType<typeof Box>) => (below ? <Box flexDirection="column">{below}{own}</Box> : own)
 
-    if (!v.five && !v.seven && v.usd === null && v.tokIn + v.tokOut === 0) {
-      return <Box><Text dimColor>token-usage：等待第一次回應後顯示額度…</Text></Box>
+    if (!v.five && !v.seven && v.usd === null && v.tokIn + v.tokWrite + v.tokOut + v.tokCache === 0) {
+      return stack(<Box><Text dimColor>token-usage：等待第一次回應後顯示額度…</Text></Box>)
     }
 
-    if ('Svg' in t) {
-      const { Svg } = t
+    // ui.resolve completes every surface's table to every element name (an element
+    // the surface lacks draws an empty fragment), so `'Svg' in t` is true on the
+    // terminal too and the band drew nothing there. Branch on the surface instead.
+    if (e.surface !== 'terminal') {
+      const { Svg } = $.ui.resolve(e)
       const { w, svg } = strip(v, now)
-      return <Box><Svg source={svg} alt="5h / 7d 額度、token 與花費" width={w} height={28} isInteractive /></Box>
+      return stack(<Box><Svg source={svg} alt="5h / 7d 額度、token 與花費" width={w} height={28} isInteractive /></Box>)
     }
 
     const line = [
       v.five && `5h ${bar(v.five, 5 * H, now)} ${Math.round(v.five.used)}% ↻ ${left(v.five.resetsAt, now)}`,
       v.seven && `7d ${bar(v.seven, 7 * 24 * H, now)} ${Math.round(v.seven.used)}% ↻ ${left(v.seven.resetsAt, now)}`,
-      `⇧ ${k(v.tokIn)}  ⇩ ${k(v.tokOut)}  ▤ ${k(v.tokCache)}`,
+      `⇧ ${k(v.tokIn + v.tokWrite)}${v.tokWrite ? ` (寫 ${k(v.tokWrite)})` : ''}  ⇩ ${k(v.tokOut)}  ▤ ${k(v.tokCache)}`,
       v.usd !== null && `$${v.usd.toFixed(2)}`,
     ].filter(Boolean).join('  │  ')
-    return <Box><Text>{line}</Text></Box>
+    return stack(<Box><Text>{line}</Text></Box>)
   })
 }

@@ -1,16 +1,21 @@
+**English** | [繁體中文](README.zh-TW.md)
+
 # token-usage
 
-Claude Desktop（Code 分頁）輸入框上方的用量條：5h / 7d 額度、token 用量、花費。
+A usage strip above the prompt box in Claude Desktop (Code tab): 5h / 7d rate-limit quota, token usage and cost. It also draws a compact text line in the terminal CLI.
 
-## 安裝
-- macOS：`bash install.sh`
-- Windows：在 PowerShell 執行 `powershell -ExecutionPolicy Bypass -File install.ps1`
+> This is a fork of [letswritetw/claude-mod-token-usage](https://github.com/letswritetw/claude-mod-token-usage).
+> **v1.1.0** fixes the token counts being badly undercounted (now counted once per API response), the band not showing in the terminal, and the band hiding other plugins' content. See the [CHANGELOG](CHANGELOG.md).
 
-完成後完全關閉並重開 Claude Desktop。腳本會備份並合併 `~/.claude/settings.json`（只新增 `env` 內兩個變數）。
+## Install
+- macOS: `bash install.sh`
+- Windows: run `powershell -ExecutionPolicy Bypass -File install.ps1` in PowerShell
 
-## 需求
-- 支援 mod 功能的新版 Claude Code / Claude Desktop
-- 5h / 7d 額度需訂閱帳號；第一次回應後才有資料
+When it finishes, fully quit and reopen Claude Desktop. The script backs up and merges `~/.claude/settings.json` (it only adds two variables under `env`).
 
-## 解除安裝
-刪除 `~/.claude/mods/token-usage`，並從 `settings.json` 的 `env` 移除 `CLAUDE_CODE_PLUGIN_DIRS` 與 `CLAUDE_CODE_PLUGIN_DIR_WATCH`。
+## Requirements
+- A recent Claude Code / Claude Desktop that supports mods
+- The 5h / 7d quota needs a subscription account; data appears after the first response
+
+## Uninstall
+Delete `~/.claude/mods/token-usage` and remove `CLAUDE_CODE_PLUGIN_DIRS` and `CLAUDE_CODE_PLUGIN_DIR_WATCH` from `env` in `settings.json`.

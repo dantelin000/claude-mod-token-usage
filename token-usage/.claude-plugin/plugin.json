@@ -1,6 +1,6 @@
 {
   "name": "token-usage",
-  "version": "0.1.0",
+  "version": "1.1.0",
   "description": "5h / 7d usage, token totals and cost pills above the prompt",
   "types": "./types/index.d.ts"
 }
