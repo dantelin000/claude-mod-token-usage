@@ -5,6 +5,7 @@
 Claude Desktop（Code 标签页）输入框上方的用量条：5h / 7d 额度、token 用量、花费。在终端机版 CLI 里会显示成一行文字。
 
 > 这是 [letswritetw/claude-mod-token-usage](https://github.com/letswritetw/claude-mod-token-usage) 的 fork。
+> **v1.1.1** 修正分支（fork）出来的会话把父会话的费用当成自己的：金额格现在只显示这个对话自己的花费。
 > **v1.1.0** 修正 token 三格严重少算（改为每个 API 回应计一次）、终端机版不显示、盖掉其他插件内容的问题，详见 [更新记录](CHANGELOG.zh-CN.md)。
 
 ## 安装

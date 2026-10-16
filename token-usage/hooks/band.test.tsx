@@ -65,6 +65,80 @@ test('every response of a turn counts once; the turn total does not count again'
   await ui.unmount()
 })
 
+// 2026-10-16 fix: the amount is this conversation's own spend. A fork copies its parent's ledger
+// ($4.36 of Opus in the case that showed it), which is not what the fork costs.
+const ledger = (usd: number) => ({ context: { window: 1_000_000 }, rateLimits: [], cost: { usd } })
+const start = { cwd: '/', surface: 'terminal' as const, isInteractive: true }
+const measure = (usd: number) => ({ ...ledger(usd), changed: ['cost'] }) as any
+// the engine's side of a session: its id, its ledger, and the two events the plugin observes
+const engine = (on: any, sid: string, usd?: number) => {
+  on('session.id', async () => ({ value: sid }))
+  on('session.usage', async () => ({ value: { startedAt: 1000, context: { window: 1_000_000 }, rateLimits: [], ...(usd === undefined ? {} : { cost: { usd } }) } }))
+  on('session.start', async (_$: any, e: any) => ({ cwd: e.cwd }))
+  on('session.measure', async (_$: any, e: any) => ({ changed: e.changed }))
+}
+const costBand = async ($: any) => $.ui.mount({ plugin: 'token-usage', surface: 'terminal', component: 'AbovePrompt', props: {} as any })
+
+test('a fork shows its own spend, not the ledger it inherited', async ($, on) => {
+  mock.clock(on)
+  mock.store(on)
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => { const { Box } = $.ui.resolve(e); return <Box /> })
+  engine(on, 'fork-1', 4.36)
+  await $.session.start(start)
+  await $.session.measure(measure(4.44))
+  const ui = await costBand($)
+  expect(await ui.find({ type: 'Text', text: /\$0\.08/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /\$4\.44/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('a resumed session keeps the baseline it saved', async ($, on) => {
+  mock.clock(on)
+  mock.store(on, { 'sess:fork-2': { tokIn: 5, tokWrite: 0, tokOut: 5, tokCache: 0, startedAt: 1000, since: 1000, base: 4.36 } })
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => { const { Box } = $.ui.resolve(e); return <Box /> })
+  engine(on, 'fork-2', 4.4)
+  await $.session.start(start)
+  const ui = await costBand($)
+  expect(await ui.find({ type: 'Text', text: /\$0\.04/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a session saved before baselines existed keeps showing the whole ledger', async ($, on) => {
+  mock.clock(on)
+  mock.store(on, { 'sess:old-1': { tokIn: 5, tokWrite: 0, tokOut: 5, tokCache: 0, startedAt: 1000, since: 1000 } })
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => { const { Box } = $.ui.resolve(e); return <Box /> })
+  engine(on, 'old-1', 3.21)
+  await $.session.start(start)
+  const ui = await costBand($)
+  expect(await ui.find({ type: 'Text', text: /\$3\.21/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a new session starts at zero and counts everything after', async ($, on) => {
+  mock.clock(on)
+  mock.store(on)
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => { const { Box } = $.ui.resolve(e); return <Box /> })
+  engine(on, 'new-1', 0)
+  await $.session.start(start)
+  await $.session.measure(measure(0.5))
+  const ui = await costBand($)
+  expect(await ui.find({ type: 'Text', text: /\$0\.50/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a ledger first seen at the first measure is the start only while nothing was counted', async ($, on) => {
+  mock.clock(on)
+  mock.store(on)
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => { const { Box } = $.ui.resolve(e); return <Box /> })
+  engine(on, 'late-1') // no ledger at start
+  await $.session.start(start)
+  await $.session.measure(measure(4.36)) // nothing counted yet: this is where the conversation began
+  await $.session.measure(measure(4.44))
+  const ui = await costBand($)
+  expect(await ui.find({ type: 'Text', text: /\$0\.08/ })).toBeDefined()
+  await ui.unmount()
+})
+
 test('a turn with no step usage falls back to its own total', async ($, on) => {
   mock.clock(on)
   on('ui.render', { component: 'AbovePrompt' }, ($, e) => { const { Box } = $.ui.resolve(e); return <Box /> })

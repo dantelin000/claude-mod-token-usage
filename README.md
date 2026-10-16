@@ -5,6 +5,7 @@
 A usage strip above the prompt box in Claude Desktop (Code tab): 5h / 7d rate-limit quota, token usage and cost. It also draws a compact text line in the terminal CLI.
 
 > This is a fork of [letswritetw/claude-mod-token-usage](https://github.com/letswritetw/claude-mod-token-usage).
+> **v1.1.1** fixes the cost cell showing a fork's inherited cost as its own: it now shows what this conversation itself has spent.
 > **v1.1.0** fixes the token counts being badly undercounted (now counted once per API response), the band not showing in the terminal, and the band hiding other plugins' content. See the [CHANGELOG](CHANGELOG.md).
 
 ## Install

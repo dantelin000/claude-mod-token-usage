@@ -3,7 +3,7 @@ import type { Register } from 'claude-code'
 
 import type { Snap, Win } from '../types'
 
-const EMPTY: Snap = { five: null, seven: null, usd: null, tokIn: 0, tokWrite: 0, tokOut: 0, tokCache: 0, sid: null, startedAt: null, since: null }
+const EMPTY: Snap = { five: null, seven: null, usd: null, base: null, tokIn: 0, tokWrite: 0, tokOut: 0, tokCache: 0, sid: null, startedAt: null, since: null }
 const snap = atom({ plugin: 'token-usage', key: 'snap' } as const, EMPTY)
 
 const tick = atom({ plugin: 'token-usage', key: 'tick' } as const, 0)
@@ -34,10 +34,14 @@ const SKEY = 'sess:'
 const persist = async ($: any) => {
   const v = await read($, snap)
   if (!v.sid) return
-  await $.store.set(SKEY + v.sid, { tokIn: v.tokIn, tokWrite: v.tokWrite, tokOut: v.tokOut, tokCache: v.tokCache, startedAt: v.startedAt, since: v.since })
+  await $.store.set(SKEY + v.sid, { tokIn: v.tokIn, tokWrite: v.tokWrite, tokOut: v.tokOut, tokCache: v.tokCache, startedAt: v.startedAt, since: v.since, base: v.base })
   const old = ((await $.store.keys()) as string[]).filter(x => x.startsWith(SKEY) && x !== SKEY + v.sid)
   for (const x of old.slice(0, Math.max(0, old.length - KEEP))) await $.store.delete(x)
 }
+// what this conversation itself has cost. A fork copies its parent's ledger, so the engine's total
+// starts at the parent's spend (2026-10-16: a Haiku fork of an Opus chat opened at $4.36 for ~$0.1
+// of its own); the amount is the ledger less what it held when this conversation began counting.
+const spent = (v: Snap) => (v.usd === null ? null : Math.max(0, v.usd - (v.base ?? 0)))
 const hhmm = (ms: number) => {
   const d = new Date(ms)
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
@@ -149,7 +153,9 @@ const strip = (v: Snap, now: number) => {
   add(chip(x, 'down', k(v.tokOut), '#10B981', '#34D399', `輸出 token：模型在本工作階段產生的內容共 ${k(v.tokOut)}`))
   add(chip(x, 'layers', k(v.tokCache), '#6366F1', '#818CF8', `快取讀取 token：從提示快取重複使用 ${k(v.tokCache)}，計費較一般輸入低`), 18)
   const partial = v.since !== null && v.startedAt !== null && v.since - v.startedAt > 120_000
-  if (v.usd !== null) add(chip(x, 'coin', `$${v.usd.toFixed(2)}`, '#F59E0B', '#FBBF24', `工作階段費用：依 API 牌價約 $${v.usd.toFixed(2)} 美元（Claude Code 帳本，與 /cost 相同，含子代理與壓縮）` + (partial ? `&#10;token 計數自 ${hhmm(v.since!)} 起；此前的用量只算進金額` : '')))
+  const own = spent(v)
+  const carried = v.usd !== null ? Math.min(v.base ?? 0, v.usd) : 0
+  if (own !== null) add(chip(x, 'coin', `$${own.toFixed(2)}`, '#F59E0B', '#FBBF24', `本對話費用：依 API 牌價約 $${own.toFixed(2)} 美元（Claude Code 帳本，含子代理與壓縮）` + (carried >= 0.005 ? `&#10;不含起算前已有的 $${carried.toFixed(2)}（從別的對話分支而來）；/cost 的帳本總額為 $${v.usd!.toFixed(2)}` : '') + (partial ? `&#10;token 計數自 ${hhmm(v.since!)} 起` : '')))
   const w = Math.ceil(x - 8)
   return { w, svg: `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="28" viewBox="0 0 ${w} 28"><style>:root{color-scheme:light dark;background:transparent}.p{cursor:help}.p .h{transition:fill-opacity .12s}.p:hover .h{fill-opacity:.26}</style>${parts.join('')}</svg>` }
 }
@@ -174,7 +180,7 @@ export const register: Register = on => {
     // session saved (a restart or resume), else start over (a new session, a /clear)
     try {
       const sid = await $.session.id()
-      const { startedAt } = await $.session.usage()
+      const { startedAt, cost } = await $.session.usage()
       const v = await read($, snap)
       if (v.sid !== sid || v.startedAt !== startedAt) {
         const saved = (await $.store.get(SKEY + sid)) as Partial<Snap> | undefined
@@ -189,7 +195,12 @@ export const register: Register = on => {
           sid,
           startedAt,
           since: ok ? saved!.since ?? startedAt : Math.max(startedAt, now - 60_000),
+          // the ledger as the conversation opens: a fork's already holds its parent's spend, which is
+          // not this conversation's. A record from before this was kept stays on the whole ledger.
+          usd: cost ? cost.usd : null,
+          base: ok ? saved!.base ?? 0 : cost ? cost.usd : null,
         }))
+        await persist($)
       }
     } catch {}
     return next(e)
@@ -226,12 +237,19 @@ export const register: Register = on => {
   on('session.measure', async ($, e, next) => {
     const f = e.rateLimits.find(r => r.kind === 'five_hour')
     const s = e.rateLimits.find(r => r.kind === 'seven_day')
-    await update($, snap, v => ({
-      ...v,
-      five: f ? { used: f.percentUsed, resetsAt: f.resetsAt } : v.five,
-      seven: s ? { used: s.percentUsed, resetsAt: s.resetsAt } : v.seven,
-      usd: e.cost ? e.cost.usd : v.usd,
-    }))
+    await update($, snap, v => {
+      const usd = e.cost ? e.cost.usd : v.usd
+      // no ledger was readable at start: the first one seen is the conversation's start only while
+      // nothing of its own has been counted; later it cannot be told apart, so the whole ledger shows
+      const base = v.base ?? (usd === null ? null : v.tokIn + v.tokWrite + v.tokOut + v.tokCache === 0 ? usd : 0)
+      return {
+        ...v,
+        five: f ? { used: f.percentUsed, resetsAt: f.resetsAt } : v.five,
+        seven: s ? { used: s.percentUsed, resetsAt: s.resetsAt } : v.seven,
+        usd,
+        base,
+      }
+    })
     return next(e)
   })
 
@@ -257,7 +275,8 @@ export const register: Register = on => {
     const below = await next(e)
     const stack = (own: ReturnType<typeof Box>) => (below ? <Box flexDirection="column">{below}{own}</Box> : own)
 
-    if (!v.five && !v.seven && v.usd === null && v.tokIn + v.tokWrite + v.tokOut + v.tokCache === 0) {
+    const own = spent(v)
+    if (!v.five && !v.seven && own === null && v.tokIn + v.tokWrite + v.tokOut + v.tokCache === 0) {
       return stack(<Box><Text dimColor>token-usage：等待第一次回應後顯示額度…</Text></Box>)
     }
 
@@ -274,7 +293,7 @@ export const register: Register = on => {
       v.five && `5h ${bar(v.five, 5 * H, now)} ${Math.round(v.five.used)}% ↻ ${left(v.five.resetsAt, now)}`,
       v.seven && `7d ${bar(v.seven, 7 * 24 * H, now)} ${Math.round(v.seven.used)}% ↻ ${left(v.seven.resetsAt, now)}`,
       `⇧ ${k(v.tokIn + v.tokWrite)}${v.tokWrite ? ` (寫 ${k(v.tokWrite)})` : ''}  ⇩ ${k(v.tokOut)}  ▤ ${k(v.tokCache)}`,
-      v.usd !== null && `$${v.usd.toFixed(2)}`,
+      own !== null && `$${own.toFixed(2)}`,
     ].filter(Boolean).join('  │  ')
     return stack(<Box><Text>{line}</Text></Box>)
   })

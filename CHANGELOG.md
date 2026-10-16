@@ -2,6 +2,33 @@
 
 # Changelog
 
+## 1.1.1 — 2026-10-16
+
+### Fixed: a fork showed its parent's cost as its own
+
+The cost cell shows Claude Code's own cost ledger. A forked conversation starts with a **copy of its parent's ledger**, so the cell opened at the parent's total instead of at zero. Seen on a Haiku 5.5 fork of an Opus 5.5 chat: the cell read $4.44 while the fork itself had spent about $0.08. The other $4.36 was Opus spend carried over from the parent (it is the `cost-state` entry at the head of the fork's transcript). The token cells only count from the fork onwards, so the amount looked wildly out of line with them.
+
+Forking itself costs nothing (no API call is made, the ledger is just copied), and Haiku 5.5 pricing was correct throughout.
+
+**The fix**
+
+- When a conversation starts, the mod reads the ledger once (`$.session.usage().cost`) and keeps it as a **baseline** (`Snap.base`). The cost cell now shows the ledger minus that baseline: what this conversation itself has spent, compaction and subagents included.
+- The baseline is saved with the token counters per session id, so a restart or a resume keeps it.
+- Hovering the cell says what was left out and what the ledger totals, e.g. "Excludes $4.36 that was already there before this conversation began (branched from another one); /cost's ledger total is $4.44."
+- If no ledger can be read at start, the first one seen becomes the baseline only while nothing has been counted yet.
+- Added 5 tests (a fork, a resume that keeps its saved baseline, a session saved before baselines existed, a new session, a ledger first seen at the first measurement). Also checked with a real headless fork of an older session: the saved baseline equalled the parent's ledger.
+
+**Good to know**
+
+- The cell no longer equals `/cost`, which still totals the whole ledger including what a fork inherited. The 1.1.0 note "the cost cell was always correct (same number as `/cost`)" no longer holds for forks.
+- A session saved by an earlier version has no baseline and keeps showing the whole ledger. So does a session that was already open when you updated: restart it, because the baseline cannot be recovered afterwards. Start a new fork to see the fix.
+- A resumed session the mod never saw (for example one that ran before you installed it) starts counting at the resume, so its earlier spend is left out of the cell (`/cost` still has it).
+
+### Other
+
+- Version 1.1.0 → 1.1.1.
+- Tests: 5 → 10.
+
 ## 1.1.0 — 2026-10-14
 
 ### Fixed: token cells were badly undercounted

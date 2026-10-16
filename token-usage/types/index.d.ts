@@ -2,7 +2,10 @@ export type Win = { used: number; resetsAt?: string }
 export type Snap = {
   five: Win | null
   seven: Win | null
+  /** the engine's cost ledger, as /cost totals it: a fork starts with its parent's spend already in it */
   usd: number | null
+  /** the ledger when this conversation began counting: what a fork inherited. The band shows usd - base. */
+  base: number | null
   /** uncached input tokens (full input price) */
   tokIn: number
   /** tokens written to the prompt cache (1.25x / 2x input price) */
