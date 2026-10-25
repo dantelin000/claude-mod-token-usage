@@ -148,3 +148,71 @@ test('a turn with no step usage falls back to its own total', async ($, on) => {
   expect(await ui.find({ type: 'Text', text: /⇩ 4\.2k/ })).toBeDefined()
   await ui.unmount()
 })
+
+// subagents step in their own loop: each run is its own turn (its own turnId) and its steps carry
+// its agentId. A fork subagent is one too; its first request carries the parent's whole context,
+// so it reads a lot from the cache. A background run may end after the main turn did.
+const steps: Record<string, { agentId?: string; usage: ReturnType<typeof step>[] }> = {
+  m1: { usage: [0, 1].map(() => ({ ...step(0), output_tokens: 1000, cache_creation_input_tokens: 0 })) },
+  s1: { agentId: 'a-sub', usage: [0, 1].map(() => ({ ...step(0), input_tokens: 0, output_tokens: 500, cache_creation_input_tokens: 5000, cache_read_input_tokens: 20_000 })) },
+  f1: { agentId: 'a-fork', usage: [{ ...step(0), input_tokens: 0, output_tokens: 2000, cache_creation_input_tokens: 1000, cache_read_input_tokens: 400_000 }] },
+}
+const sum = (us: ReturnType<typeof step>[]) => ({
+  input_tokens: us.reduce((n, u) => n + u.input_tokens, 0),
+  output_tokens: us.reduce((n, u) => n + u.output_tokens, 0),
+  cache_creation_input_tokens: us.reduce((n, u) => n + u.cache_creation_input_tokens, 0),
+  cache_read_input_tokens: us.reduce((n, u) => n + u.cache_read_input_tokens, 0),
+  model: 'claude-opus-5-5',
+})
+const runStep = ($: any, turnId: string, index: number) =>
+  drive($.turn.step({ turnId, index, model: 'claude-opus-5-5', messageCount: 1, agentId: steps[turnId].agentId } as any))
+// the turn's own total as the host carries it: the last response only (see the 2026-10-14 fix);
+// `whole` gives the true sum, for a run none of whose steps reported usage
+const endTurn = ($: any, turnId: string, whole = false) => {
+  const us = steps[turnId].usage
+  const usage = whole ? sum(us) : { ...us[us.length - 1], model: 'claude-opus-5-5' }
+  return $.turn.complete({ ...done, turnId, agentId: steps[turnId].agentId, usage } as any)
+}
+
+test('subagent and fork subagent responses count once each, with the main loop', async ($, on) => {
+  mock.clock(on)
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => { const { Box } = $.ui.resolve(e); return <Box /> })
+  on('turn.step', async function* ($, e) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: steps[e.turnId].usage[e.index] } as any
+  })
+  on('turn.complete', async () => ({ text: 'ok' }))
+  await runStep($, 'm1', 0) // the main loop calls Agent twice: a subagent and a background fork
+  await runStep($, 's1', 0)
+  await runStep($, 's1', 1)
+  await endTurn($, 's1')
+  await runStep($, 'm1', 1)
+  await endTurn($, 'm1') // the main turn ends while the fork still runs
+  await runStep($, 'f1', 0)
+  await endTurn($, 'f1')
+  const ui = await $.ui.mount({ plugin: 'token-usage', surface: 'terminal', component: 'AbovePrompt', props: {} as any })
+  // output 2 x 1k + 2 x 500 + 2k = 5.0k; cache reads 2 x 100k + 2 x 20k + 400k = 640.0k;
+  // written 2 x 5k + 1k = 11.0k, new input 11.0k + 20 uncached
+  expect(await ui.find({ type: 'Text', text: /⇩ 5\.0k/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /▤ 640\.0k/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /⇧ 11\.0k \(寫 11\.0k\)/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a subagent run with no step usage falls back to its own total', async ($, on) => {
+  mock.clock(on)
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => { const { Box } = $.ui.resolve(e); return <Box /> })
+  on('turn.step', async function* ($, e) {
+    const usage = e.agentId === undefined ? steps.m1.usage[e.index] : null
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage } as any
+  })
+  on('turn.complete', async () => ({ text: 'ok' }))
+  await runStep($, 'm1', 0)
+  await runStep($, 's1', 0)
+  await endTurn($, 's1', true) // its steps reported nothing: its own total, 2 x 500 out, counts
+  await runStep($, 'm1', 1)
+  await endTurn($, 'm1')
+  const ui = await $.ui.mount({ plugin: 'token-usage', surface: 'terminal', component: 'AbovePrompt', props: {} as any })
+  expect(await ui.find({ type: 'Text', text: /⇩ 3\.0k/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /▤ 240\.0k/ })).toBeDefined()
+  await ui.unmount()
+})
