@@ -2,6 +2,48 @@
 
 # 更新紀錄
 
+## 1.3.0 — 2026-10-28
+
+同時做了兩件事：Bash / MCP 工具呼叫印出的用量現在不用 `tu-log` 也會被記下；`/usage-ext` 也內建價格表，開箱就能估價。**內建價格最後更新：2026-10-28。** 用量條不變。
+
+### 新增：從工具結果自動擷取
+
+- `tool.call` hook 會讀本會話中每個 **Bash 與 MCP 工具呼叫** 的輸出。輸出裡完整的 JSON 物件若帶有 provider 的 usage（Gemini / Vertex 的 `usageMetadata`、Gemini CLI 的 `stats.models`、OpenAI chat 與 Responses、Anthropic、Ollama），就加進帳本。只留數字，不留提示詞、回覆、指令與輸出文字；每行帶會話 id（`$.session.id()`）、工具名稱，以及輸出裡有的話帶上 `provider` / `model`（provider 取自 Ollama 的回覆格式或 `claude-*` / `gpt-*` / o 系列的模型 id；Gemini 不填）。
+- **不重複計算。** 指令執行期間若已用 `tu-log` 記下同一次呼叫（同一會話、同樣的數字、不矛盾的模型，時間落在該次呼叫前後 5 秒內），自動那一行就略過；同一份輸出裡印兩次的同樣數字只算一次；重播的 `tool_use_id` 不會再記。
+- **不記：** 只是顯示檔案或文字的指令（`cat`、`grep`、`jq`、`git diff`……，所以讀文件或對話紀錄不會把裡面的範例記進去）、帳本本身的行（所以讀帳本不會再記一次）、通用的 `{input, output}` 組合、Python repr、被截斷的 JSON、token 為零的物件。`TOKEN_USAGE_AUTO=off` 可關閉（已驗證：作為 shell 變數，以及放在設定的 `env` 裡都有效）。
+- **存在自己的檔案裡**，`ledger/YYYY-MM-DD.auto-<會話>.jsonl`：mod 只能整個檔案重寫，而不能重寫 `tu-log` 正在追加的當日檔案。當日檔案只讀，用來找指令自己記下的那一行。`/usage-ext` 兩種檔案都讀，並說明有幾行是自動記下的。
+- 已在真實引擎裡驗證：用一支會印出回應的腳本，一次單獨執行（記一行），一次同時呼叫 `tu-log`（只有 `tu-log` 那一行）。mod 看到的會話 id 等於 Bash 工具裡的 `$CLAUDE_CODE_SESSION_ID`，CLI 自己產生新會話 id 時也一樣。
+
+### 新增：內建價格表
+
+- `prices.default.json` 隨 mod 發行（經 `$.plugin.root` 讀取），並與你的 `prices.json` 合併：你填的某個模型整筆取代內建那一筆，其餘用內建價格。共 75 個模型，標準（Standard）等級牌價：**Anthropic 20、OpenAI 44、Gemini API 11**。每個價格都是 2026-10-28 當天從 provider 自己的價格頁讀到的（Anthropic 的另與 `claude` 執行檔內的模型目錄交叉核對，20 個全部一致）。檔案帶有 `updated` 與 `sources`；`/usage-ext` 會印出「built-in prices updated 2026-10-28」（`json` 輸出有 `builtinPrices`）。
+- **價格會變。** 以 provider 的帳單為準。這張表之後會以修補版本（1.3.1……）更新，每次帶新日期。`scripts/check-prices.py` 用來在更新後檢查檔案格式。
+- **Vertex AI：** 該頁面讀得到（要用瀏覽器的 User-Agent），並已對照：表中所有 Gemini 模型，其全球端點、標準等級的輸入、輸出與快取輸入單價都與 Gemini API 相同，只有 `gemini-3-flash-preview`（該頁沒列輸出單價）與 `gemini-3.1-pro-preview-customtools`（該頁沒列）例外。Vertex 的區域端點（貴 10%）未計入。
+- **未收錄（絕不當成 $0）：** 表裡沒有的模型只統計 token，標為未定價。未收錄：Anthropic 的 Batch、快速模式、`inference_geo` 1.1 倍、工具費、Claude 3.5 / 3.7 Sonnet（價格頁沒有）；OpenAI 的 Batch / Flex / Fast / Ultrafast、區域加價 10%、快取寫入價、realtime / 音訊 / 圖像 / 語音 / 轉錄 / embedding / moderation / 微調；Gemini 的 Batch / Flex / Priority / Contributor、快取儲存、grounding、免費額度、live / translate / transcribe / TTS / image / Omni / robotics 模型，以及只有 Vertex 頁面列出的模型（3.7 Flash、3.5 Flash、2.0、Cyber 變體）。部分 Gemini 模型的音訊輸入較貴，這裡用文字單價，備註有寫。OpenRouter 與本機 Ollama 模型不在範圍內。
+- `gpt-5.6-sol` 是促銷價（OpenAI：至少到 2026-11-21 有效，未公布正常價）；該筆有備註，用到時 `/usage-ext` 會印出。
+
+### 變更：價格處理
+
+- **`effective`**：價格可設定從某個日期起改用的單價（`"effective": [{"from": "2026-12-01", "input": 4, ...}]`）；每筆記錄依其 `ts` 的 UTC 日期計價（各頁面沒給時區，假定為 UTC），所以舊記錄保留當時的價格。用於 `gemini-4-argon`（2026-12-01）與 `gemini-3.8-flash` / `gemini-3.6-flash`（2027-01-01）。可加自由文字的 `note`。
+- **`cacheWrite1h`**：Anthropic 的 1 小時快取寫入（`usage.cache_creation.ephemeral_1h_input_tokens`）有自己的 token 類別與單價（缺時用 `cacheWrite`，再缺用輸入價），1 小時寫入的估價不再偏低。
+- **帶後綴的模型 id** 也找得到：原樣、最後一個 `/` 之後、去掉結尾 `-YYYYMMDD`、`-YYYY-MM-DD`、`@YYYYMMDD` 或 `-latest`（`claude-sonnet-4-5-20250929`、`gpt-5-2025-08-07`、`publishers/google/models/gemini-2.5-pro`）。不做前綴比對：`gpt-5.1-codex` 不是 `gpt-5.1`。
+- 以每 1,000 token 為單位的 `prices.json` 仍可與內建表並用（內建單價會依你的 `per` 換算）。
+- 帳本讀取也接受 `YYYY-MM-DD.<名稱>.jsonl`（檔案數上限 400 → 1000）；舊版會忽略這些檔案。
+
+### 測試
+
+- 21 → 44。其中兩個是分支 `claude/focused-dirac-r2yzo2`（提交 b16d912）的「子代理與 fork 子代理每個回應只計一次」測試，已確認算術正確、且在「每個回應計一次」的邏輯被破壞時會失敗，之後 cherry-pick 進來；該分支本身保持原樣。
+- 上述每條規則都有測試，防止重複計算與誤擷取的那幾條還做了「拿掉防護、看測試失敗」的檢查。`claude plugin test` 讀不了檔案，所以內建表本身的格式由 `scripts/check-prices.py` 檢查；端到端的檢查是在真實引擎裡執行 `/usage-ext`。
+
+**限制**
+
+- 只有真的被印出來的用量才抓得到：只印回覆文字的腳本還是要加一行 `tu-log`。*之後另外*再用 `tu-log` 記一次「用量已被印出」的回應，會被再算一次。串流事件日誌裡重複或累計的用量不會去重。
+- 指令的輸出文字仍是簡體中文。輔助腳本未在 Windows 測試。
+
+### 其他
+
+- 版本號 1.2.0 → 1.3.0。
+
 ## 1.2.0 — 2026-10-28
 
 ### 新增：外部 API 用量帳本與 `/usage-ext`

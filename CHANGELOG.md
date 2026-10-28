@@ -2,6 +2,48 @@
 
 # Changelog
 
+## 1.3.0 — 2026-10-28
+
+Two things at once: usage printed by Bash / MCP tool calls is now logged without `tu-log`, and `/usage-ext` estimates cost out of the box with a built-in price table. **Built-in prices last updated: 2026-10-28.** The strip is unchanged.
+
+### Added: automatic capture from tool results
+
+- A `tool.call` hook reads the output of every **Bash and MCP tool call** in the session. A complete JSON object that carries a provider's usage (Gemini / Vertex `usageMetadata`, Gemini CLI `stats.models`, OpenAI chat and Responses, Anthropic, Ollama) is appended to the ledger. Only the numbers are kept, never the prompt, the reply, the command or the output; the line carries the session id (`$.session.id()`), the tool's name, and `provider` / `model` when the output carries them (provider from Ollama's reply shape or a `claude-*` / `gpt-*` / o-series model id; Gemini gets none).
+- **No double counting.** If the command logged the same call with `tu-log` while it ran (same session, same numbers, a model that agrees, within the call's time window ± 5 s) the automatic line is skipped; the same numbers printed twice in one output count once; a replayed `tool_use_id` adds nothing.
+- **Not logged:** commands that only view files or text (`cat`, `grep`, `jq`, `git diff`, ...; so reading a document or a transcript does not log its examples), ledger lines (so reading the ledger does not log it again), the generic `{input, output}` pair, Python reprs, truncated JSON, zero-token objects. `TOKEN_USAGE_AUTO=off` turns it off (checked: as a shell variable and under `env` in settings).
+- **Stored in its own file**, `ledger/YYYY-MM-DD.auto-<session>.jsonl`: the mod can only write a file whole, and must not rewrite the day file `tu-log` appends to. The day files are only read, to find a line the command logged itself. `/usage-ext` reads both and says how many lines were logged automatically.
+- Checked in the real engine with a script that prints a response, once alone (logged once) and once also calling `tu-log` (one line, from `tu-log`): the id the mod sees equals `$CLAUDE_CODE_SESSION_ID` in the Bash tool, also when the CLI mints a fresh session id.
+
+### Added: built-in price table
+
+- `prices.default.json`, shipped with the mod (read through `$.plugin.root`) and merged with your `prices.json`: your entry for a model replaces the shipped one whole, the shipped ones fill the rest. 75 models at Standard-tier list prices: **Anthropic 20, OpenAI 44, Gemini API 11**. Every price was read from the provider's own pricing page on 2026-10-28 (Anthropic's cross-checked against the model catalog inside the `claude` binary, where all 20 agree). The file carries `updated` and `sources`; `/usage-ext` prints "built-in prices updated 2026-10-28" (and `json` has `builtinPrices`).
+- **Prices change.** The provider's bill is authoritative. The table is refreshed as patch releases (1.3.1, ...), each with a new date. `scripts/check-prices.py` checks the file's shape after a refresh.
+- **Vertex AI:** the page could be read (with a browser User-Agent) and was compared: its Global-endpoint Standard input, output and cached prices equal the Gemini API rows for every Gemini model in the table except `gemini-3-flash-preview` (no output price listed there) and `gemini-3.1-pro-preview-customtools` (not listed). Regional Vertex endpoints (+10%) are not modelled.
+- **Left out (never read as $0):** a model that is not in the table is counted in tokens and shown unpriced. Not included: Anthropic Batch, fast mode, `inference_geo` 1.1x, tool fees, Claude 3.5 / 3.7 Sonnet (not on the pricing page); OpenAI Batch / Flex / Fast / Ultrafast, regional +10%, cache-write prices, realtime / audio / image / speech / transcription / embedding / moderation / fine-tuning; Gemini Batch / Flex / Priority / Contributor, cache storage, grounding, the free tier, live / translate / transcribe / TTS / image / Omni / robotics models, and models only the Vertex page lists (3.7 Flash, 3.5 Flash, 2.0, Cyber variants). Audio input is billed higher on some Gemini models; the text price is used and those entries say so. OpenRouter and local Ollama models are not covered.
+- `gpt-5.6-sol` is a promotional price (OpenAI: available at least through 2026-11-21, no regular price published); its entry says so and `/usage-ext` prints the note when it is used.
+
+### Changed: price handling
+
+- **`effective`**: a price entry may change rates from a date on (`"effective": [{"from": "2026-12-01", "input": 4, ...}]`); a record is priced by the UTC day of its `ts` (UTC assumed: the pages give no time zone), so old records keep the price of their day. Used for `gemini-4-argon` (2026-12-01) and `gemini-3.8-flash` / `gemini-3.6-flash` (2027-01-01). A free-text `note` is allowed.
+- **`cacheWrite1h`**: Anthropic's 1-hour cache writes (`usage.cache_creation.ephemeral_1h_input_tokens`) are their own token class with their own rate (falls back to `cacheWrite`, then input), so the estimate is no longer low for them.
+- **Model ids with a suffix** are found: as given, after the last `/`, and without a trailing `-YYYYMMDD`, `-YYYY-MM-DD`, `@YYYYMMDD` or `-latest` (`claude-sonnet-4-5-20250929`, `gpt-5-2025-08-07`, `publishers/google/models/gemini-2.5-pro`). No prefix matching: `gpt-5.1-codex` is not `gpt-5.1`.
+- A `prices.json` kept per 1,000 tokens still works with the shipped table (the shipped rates are rescaled to your `per`).
+- The ledger reader also accepts `YYYY-MM-DD.<name>.jsonl` files (cap 400 → 1000 files); older versions ignore them.
+
+### Tests
+
+- 21 → 44. Two of them are the subagent / fork-subagent "counts once per response" tests from the branch `claude/focused-dirac-r2yzo2` (commit b16d912), cherry-picked after checking the arithmetic and that they fail when the once-per-response logic is broken; the branch itself is left as it is.
+- Each rule above is tested, and the ones that guard against double counting and false captures were checked by removing the guard and watching a test fail. `claude plugin test` cannot read files, so the shipped table's own shape is checked by `scripts/check-prices.py`; the end-to-end check is `/usage-ext` in the real engine.
+
+**Limits**
+
+- Only usage that is really printed can be captured: a script that prints only the reply text still needs a `tu-log` line. A later, separate `tu-log` call for a response whose usage was already printed is counted again. Repeated or cumulative usage in a streamed event log is not deduplicated.
+- The command's output text is still Simplified Chinese. The helper is not tested on Windows.
+
+### Other
+
+- Version 1.2.0 → 1.3.0.
+
 ## 1.2.0 — 2026-10-28
 
 ### Added: external API usage ledger and `/usage-ext`
