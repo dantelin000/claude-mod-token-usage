@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""Append one API call's token usage to the token-usage external ledger.
+
+  tu-log --provider vertex --model gemini-x < response.json
+  tu-log --provider openai '{"usage": {"prompt_tokens": 120, "completion_tokens": 30}}'
+
+Give it a whole API response or only its usage object. Only the numbers are kept (never the prompt or
+the reply), and the time and $CLAUDE_CODE_SESSION_ID are filled in. Read back with /usage-ext.
+Ledger: $TOKEN_USAGE_EXT_DIR or ~/.claude/token-usage, file ledger/YYYY-MM-DD.jsonl (local date).
+"""
+import argparse
+import datetime
+import json
+import os
+import sys
+import time
+
+WRAPPERS = ('usageMetadata', 'usage_metadata', 'usage')
+
+
+def numbers_only(o):
+    """Keep numbers and the dicts that hold them: nothing a prompt or a reply could be in."""
+    out = {}
+    for k, v in o.items():
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, (int, float)):
+            out[k] = v
+        elif isinstance(v, dict):
+            sub = numbers_only(v)
+            if sub:
+                out[k] = sub
+    return out
+
+
+def usages(doc, model):
+    """[(model, usage)] found in a response: Gemini CLI's stats.models gives one per model."""
+    stats = (doc.get('stats') or {}).get('models') if isinstance(doc.get('stats'), dict) else None
+    if isinstance(stats, dict) and stats:
+        return [(m, numbers_only(v['tokens'])) for m, v in stats.items() if isinstance(v, dict) and isinstance(v.get('tokens'), dict)]
+    for k in WRAPPERS:
+        if isinstance(doc.get(k), dict):
+            return [(model or doc.get('modelVersion') or doc.get('model'), numbers_only(doc[k]))]
+    return [(model, numbers_only(doc))]
+
+
+def main():
+    ap = argparse.ArgumentParser(description='Append API usage to the token-usage external ledger.')
+    ap.add_argument('usage', nargs='?', help='JSON text; leave out or use - to read stdin')
+    ap.add_argument('--provider', help='e.g. vertex, openai, anthropic, ollama')
+    ap.add_argument('--model', help='model name; read from the response when it carries one')
+    ap.add_argument('--session', help='default: $CLAUDE_CODE_SESSION_ID')
+    ap.add_argument('--note', help='free text, e.g. which subagent made the call')
+    a = ap.parse_args()
+
+    text = sys.stdin.read() if a.usage in (None, '-') else a.usage
+    try:
+        doc = json.loads(text)
+    except ValueError as e:
+        sys.exit('tu-log: not JSON: %s' % e)
+    if not isinstance(doc, dict):
+        sys.exit('tu-log: expected a JSON object')
+
+    base = os.environ.get('TOKEN_USAGE_EXT_DIR') or os.path.join(os.path.expanduser('~'), '.claude', 'token-usage')
+    folder = os.path.join(base, 'ledger')
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, datetime.date.today().isoformat() + '.jsonl')
+    session = a.session or os.environ.get('CLAUDE_CODE_SESSION_ID')
+
+    lines = []
+    for model, usage in usages(doc, a.model):
+        if not usage:
+            continue
+        rec = {'ts': int(time.time() * 1000), 'session': session, 'provider': a.provider, 'model': model, 'usage': usage, 'note': a.note}
+        lines.append(json.dumps({k: v for k, v in rec.items() if v is not None}, ensure_ascii=False, separators=(',', ':')) + '\n')
+    if not lines:
+        sys.exit('tu-log: no token counts found in the input')
+    # one write on an O_APPEND descriptor: concurrent callers do not interleave their lines
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        os.write(fd, ''.join(lines).encode('utf-8'))
+    finally:
+        os.close(fd)
+
+
+if __name__ == '__main__':
+    main()

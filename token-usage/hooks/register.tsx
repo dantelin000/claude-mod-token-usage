@@ -2,6 +2,8 @@ import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
 import type { Snap, Win } from '../types'
+import { parse, parseArgs, pickFiles, render, select, summarize } from './external'
+import type { Rec } from './external'
 
 const EMPTY: Snap = { five: null, seven: null, usd: null, base: null, tokIn: 0, tokWrite: 0, tokOut: 0, tokCache: 0, sid: null, startedAt: null, since: null }
 const snap = atom({ plugin: 'token-usage', key: 'snap' } as const, EMPTY)
@@ -42,6 +44,42 @@ const persist = async ($: any) => {
 // starts at the parent's spend (2026-10-16: a Haiku fork of an Opus chat opened at $4.36 for ~$0.1
 // of its own); the amount is the ledger less what it held when this conversation began counting.
 const spent = (v: Snap) => (v.usd === null ? null : Math.max(0, v.usd - (v.base ?? 0)))
+// ---- external API usage (/usage-ext): calls that do not go through Claude Code, kept in a ledger of
+// JSON lines any script can append to; see external.ts for the format and README for the helper ----
+const extDir = async ($: any): Promise<string> =>
+  ((await $.env.get('TOKEN_USAGE_EXT_DIR')) as string | undefined) || `${(await $.env.get('HOME')) ?? ''}/.claude/token-usage`
+
+const usageExt = async ($: any, args: string) => {
+  const dir = await extDir($)
+  const { scope, json } = parseArgs(args)
+  const sid = (await $.session.id()) as string
+  const { startedAt } = await $.session.usage()
+  const now = (await $.clock.now()) as number
+  let names: string[] = []
+  try {
+    names = ((await $.fs.list(`${dir}/ledger`)) as { name: string; kind: string }[]).filter(f => f.kind === 'file').map(f => f.name)
+  } catch {}
+  const recs: Rec[] = []
+  const unreadable: string[] = []
+  let bad = 0
+  for (const f of pickFiles(names, scope, now, startedAt)) {
+    try {
+      const p = parse((await $.fs.read(`${dir}/ledger/${f}`)) as string)
+      recs.push(...p.recs)
+      bad += p.bad
+    } catch {
+      unreadable.push(f)
+    }
+  }
+  let prices = null
+  try {
+    prices = JSON.parse((await $.fs.read(`${dir}/prices.json`)) as string)
+  } catch {}
+  const sum = summarize(select(recs, scope, sid, now), prices)
+  if (json) return JSON.stringify({ scope, session: sid, ...sum, skippedLines: bad, unreadableFiles: unreadable, pricesLoaded: !!prices }, null, 2)
+  return render(sum, scope, { bad, unreadable, dir, priced: !!prices })
+}
+
 const hhmm = (ms: number) => {
   const d = new Date(ms)
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
@@ -203,7 +241,18 @@ export const register: Register = on => {
         await persist($)
       }
     } catch {}
+    try {
+      await $.command.register({ name: 'usage-ext', description: '外部 API 用量与估价（读账本）', argumentHint: '[today|7d|all] [json]' })
+    } catch {}
     return next(e)
+  })
+
+  on('command.run', { command: 'usage-ext' }, async ($, e) => {
+    try {
+      return { text: await usageExt($, e.args) }
+    } catch (err) {
+      return { text: `usage-ext 失败：${err instanceof Error ? err.message : String(err)}` }
+    }
   })
 
   // one count per API response, main loop and subagents alike

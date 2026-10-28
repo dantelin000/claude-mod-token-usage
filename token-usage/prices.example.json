@@ -1,0 +1,13 @@
+{
+  "_note": "Copy to ~/.claude/token-usage/prices.json. Prices are per `per` tokens (default 1000000), in USD, from your provider's own pricing page; nothing here is a real price. A model with no input or output rate is counted in tokens but left unpriced. cached and cacheWrite default to the input rate, thinking to the output rate. longPrompt: rates for calls whose prompt (input + cached + cacheWrite) is above `above` tokens, for the whole call.",
+  "per": 1000000,
+  "models": {
+    "vertex/your-gemini-model": { "input": null, "output": null, "cached": null, "thinking": null },
+    "openai/your-model": { "input": null, "output": null, "cached": null },
+    "your-model-with-a-long-prompt-tier": {
+      "input": null,
+      "output": null,
+      "longPrompt": { "above": 200000, "input": null, "output": null }
+    }
+  }
+}

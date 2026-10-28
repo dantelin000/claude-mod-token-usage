@@ -2,6 +2,29 @@
 
 # 更新记录
 
+## 1.2.0 — 2026-10-28
+
+### 新增：外部 API 用量账本与 `/usage-ext`
+
+Claude Code 自己的费用账本只知道它自己发出的请求。子代理或脚本直接调用 Vertex AI、OpenAI、Ollama……时，它看不到。1.2.0 新增一本不限 provider、可以读回的账。**用量条不变**，不会多画任何东西。
+
+- **账本：** JSON Lines，存放在 `~/.claude/token-usage/ledger/YYYY-MM-DD.jsonl`（可用 `TOKEN_USAGE_EXT_DIR` 更改文件夹）。每行包含 provider 自己的 usage 对象、模型、时间和会话 id。
+- **`bin/tu-log`**（Python 3，只用标准库）：把整个 API 响应或只有 usage 对象记成一行。只留数字，不留提示词和回复内容，并用 `$CLAUDE_CODE_SESSION_ID` 标上会话。Gemini CLI 的结果若含多个模型，每个模型记一行。
+- **`/usage-ext [today|7d|all] [json]`：** 读账本，按模型列出调用次数、token 和估价，默认是本对话。`json` 输出机器可读的结果。在本机运行，不调用任何模型。
+- **可识别的 usage 格式：** Gemini / Vertex 的 `usageMetadata`（camelCase 和 snake_case）与 Gemini CLI 统计；OpenAI chat 和 Responses（拆出缓存和推理 token）；Anthropic（缓存读取和写入）；Ollama。
+- **价格：** 同一文件夹里的 `prices.json`，由你自己填（`prices.example.json` 是模板，里面没有任何真实价格）。每个模型可设 input、output、cached、cacheWrite、thinking，以及提示超过某长度后更高单价的 `longPrompt`。没有输入或输出单价的模型只统计 token 并标为未定价；缺 cached / cacheWrite 单价时用输入价，缺 thinking 时用输出价。
+- **测试：** 新增 11 个（共 21 个）。另在真实引擎里验证：命令读出辅助脚本写的账本，数字正确，且没有调用模型。
+
+**限制**
+
+- mod 不能监听端口，也看不到其他程序的网络流量，所以只有被记录的调用才会计入（用辅助脚本，或自己追加一行）。自动捕获（例如从工具结果里读出 usage，或本机代理）不在这个版本里。
+- 估价 = token x 你填的单价，以 provider 的账单为准。思考 token 是否按输出价计费由 provider 决定，请自行确认，不同的话设置 `thinking`。
+- 命令的输出文字目前是简体中文。辅助脚本未在 Windows 测试。
+
+### 其他
+
+- 版本号 1.1.1 → 1.2.0。
+
 ## 1.1.1 — 2026-10-16
 
 ### 修正：分支（fork）出来的会话把父会话的费用当成自己的

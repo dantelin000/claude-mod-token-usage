@@ -2,6 +2,29 @@
 
 # Changelog
 
+## 1.2.0 — 2026-10-28
+
+### Added: external API usage ledger and `/usage-ext`
+
+Claude Code's own cost ledger only knows the requests it sends itself. A subagent or a script that calls Vertex AI, OpenAI, Ollama, ... directly is invisible to it. 1.2.0 adds a provider-agnostic ledger you can read back. **The strip is unchanged**: nothing new is drawn there.
+
+- **Ledger:** JSON lines in `~/.claude/token-usage/ledger/YYYY-MM-DD.jsonl` (folder overridable with `TOKEN_USAGE_EXT_DIR`). Each line holds the provider's own usage object, the model, the time and the session id.
+- **`bin/tu-log`** (Python 3, standard library only): appends one call from a whole API response or just its usage object. It keeps only numbers, never the prompt or the reply, and tags the line with `$CLAUDE_CODE_SESSION_ID`. Gemini CLI results with several models become one line per model.
+- **`/usage-ext [today|7d|all] [json]`:** reads the ledger and prints calls, tokens and an estimated cost per model, for this conversation by default. `json` gives machine-readable output. It runs locally and makes no model call.
+- **Usage shapes understood:** Gemini / Vertex `usageMetadata` (camelCase and snake_case) and Gemini CLI stats; OpenAI chat and Responses (cached and reasoning tokens split out); Anthropic (cache reads and writes); Ollama.
+- **Prices:** `prices.json` in the same folder, filled in by you (`prices.example.json` is a template; nothing in it is a real price). Per model: input, output, cached, cacheWrite, thinking, and a `longPrompt` tier for models priced higher above a prompt size. A model with no input or output rate is counted in tokens and marked unpriced; a missing cached / cacheWrite rate uses the input rate and a missing thinking rate the output rate.
+- **Tests:** 11 new (21 in total). Also checked in the real engine: the command reads a ledger written by the helper and prints the right numbers, with no model call.
+
+**Limits**
+
+- A mod cannot listen on a port or see another program's network traffic, so a call is counted only when something logs it (the helper, or a line you append). Automatic capture, such as reading usage out of tool results or a local proxy, is not included.
+- The estimate is tokens x the prices you enter; the provider's bill is authoritative. Whether thinking tokens are billed as output is the provider's rule: check it and set `thinking` if it differs.
+- The command's output text is currently Simplified Chinese. The helper is not tested on Windows.
+
+### Other
+
+- Version 1.1.1 → 1.2.0.
+
 ## 1.1.1 — 2026-10-16
 
 ### Fixed: a fork showed its parent's cost as its own
