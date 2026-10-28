@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
 import type { Snap, Win } from '../types'
-import { parse, parseArgs, pickFiles, render, select, summarize } from './external'
+import { mergePrices, parse, parseArgs, pickFiles, render, select, summarize } from './external'
 import type { Rec } from './external'
 
 const EMPTY: Snap = { five: null, seven: null, usd: null, base: null, tokIn: 0, tokWrite: 0, tokOut: 0, tokCache: 0, sid: null, startedAt: null, since: null }
@@ -71,13 +71,19 @@ const usageExt = async ($: any, args: string) => {
       unreadable.push(f)
     }
   }
+  // the table shipped with the mod, overlaid by the user's own: their entry for a model wins
+  let builtin = null
+  try {
+    builtin = JSON.parse((await $.fs.read(`${$.plugin.root}/prices.default.json`)) as string)
+  } catch {}
   let prices = null
   try {
     prices = JSON.parse((await $.fs.read(`${dir}/prices.json`)) as string)
   } catch {}
-  const sum = summarize(select(recs, scope, sid, now), prices)
-  if (json) return JSON.stringify({ scope, session: sid, ...sum, skippedLines: bad, unreadableFiles: unreadable, pricesLoaded: !!prices }, null, 2)
-  return render(sum, scope, { bad, unreadable, dir, priced: !!prices })
+  const sum = summarize(select(recs, scope, sid, now), mergePrices(builtin, prices))
+  const date = builtin ? { updated: typeof builtin.updated === 'string' ? builtin.updated : undefined } : null
+  if (json) return JSON.stringify({ scope, session: sid, ...sum, skippedLines: bad, unreadableFiles: unreadable, pricesLoaded: !!prices, builtinPrices: date && { ...date, sources: builtin.sources } }, null, 2)
+  return render(sum, scope, { bad, unreadable, dir, priced: !!prices, builtin: date })
 }
 
 const hhmm = (ms: number) => {
