@@ -1,5 +1,5 @@
 import { test, expect, mock } from 'claude-code/testing'
-import { cost, idForms, mergePrices, normalize, parse, parseArgs, pickFiles, priceAt, select, summarize } from './external'
+import { alreadyLogged, cost, findUsages, idForms, mergePrices, normalize, onlyViews, parse, parseArgs, pickFiles, priceAt, select, summarize } from './external'
 
 // ---- one reading per provider shape ----
 
@@ -195,6 +195,8 @@ test('arguments, files and records follow the scope', async () => {
   expect(pickFiles(names, { days: 3 }, now, now)).toEqual(['2026-10-26.jsonl', '2026-10-28.jsonl'])
   // a session that began this morning: yesterday's file and later
   expect(pickFiles(names, 'session', now, new Date(2026, 9, 28, 1).getTime())).toEqual(['2026-10-28.jsonl'])
+  // the files this mod writes from tool output are read too; other names are not
+  expect(pickFiles(['2026-10-28.jsonl', '2026-10-28.auto-abc_1.jsonl', '2026-10-28.a b.jsonl', '2026-10-28.auto-x.json', 'x.auto-y.jsonl'], 'all', now, now)).toEqual(['2026-10-28.auto-abc_1.jsonl', '2026-10-28.jsonl'])
 
   const recs = [
     { ts: now - 1000, session: 'a', usage: { input: 1, output: 1 } },
@@ -296,4 +298,215 @@ test('/usage-ext prices from the table shipped with the mod, the user\'s entries
   const alone = ((await $.command.run({ command: 'usage-ext', args: '' } as any)) as any).text
   expect(alone).toContain('估价 $100.00')
   expect(alone).toContain('内置价格表更新于 2026-10-28')
+})
+
+// ---- capturing usage from Bash / MCP tool output (the tool.call hook) ----
+
+const NOW = new Date(2026, 9, 28, 12).getTime()
+const AUTO = '/ext/ledger/2026-10-28.auto-me.jsonl'
+const DAYFILE = '/ext/ledger/2026-10-28.jsonl'
+
+// the engine beneath the plugin: a filesystem in memory (reads and writes take a tick, as real ones do), the session,
+// the clock, the environment, and a tool that answers with `out.text`
+const rig = ($: any, on: any, files: Record<string, string> = {}, out: { text?: string | ((e: any) => string); isError?: boolean; deny?: string; env?: Record<string, string>; unreadable?: string } = {}) => {
+  on('clock.now', async () => ({ value: NOW }))
+  on('session.id', async () => ({ value: 'me' }))
+  on('env.get', async (_$: any, e: any) => ({ value: e.name === 'TOKEN_USAGE_EXT_DIR' ? '/ext' : out.env?.[e.name] }))
+  on('fs.read', async (_$: any, e: any) => {
+    await Promise.resolve()
+    return e.path in files && e.path !== out.unreadable ? { value: files[e.path] } : { deny: 'missing' }
+  })
+  on('fs.exists', async (_$: any, e: any) => ({ value: e.path in files }))
+  on('fs.write', async (_$: any, e: any) => {
+    await Promise.resolve()
+    files[e.path] = e.text
+    return { value: undefined }
+  })
+  on('tool.call', async (_$: any, e: any) => (out.deny ? { deny: out.deny } : { result: {}, text: (typeof out.text === 'function' ? out.text(e) : out.text) ?? '', ...(out.isError ? { isError: true } : {}) }) as any)
+  return files
+}
+const autoFiles = (files: Record<string, string>) => Object.keys(files).filter(k => k.includes('.auto-'))
+const linesOf = (text: string | undefined) => (text ?? '').split('\n').filter(Boolean).map(l => JSON.parse(l))
+const openai = (extra: object = {}) => JSON.stringify({ id: 'chatcmpl-secret-id', object: 'chat.completion', model: 'gpt-5-2025-08-07', choices: [{ message: { content: 'THE SECRET REPLY' } }], usage: { prompt_tokens: 120, completion_tokens: 30, total_tokens: 150, prompt_tokens_details: { cached_tokens: 20 } }, ...extra })
+
+test('a Bash call that prints a response with usage is logged: numbers, model, session; never the text', async ($, on) => {
+  const files = rig($, on, {}, { text: 'calling the API...\n' + openai() + '\ndone' })
+  const r: any = await $.tool.call({ tool: 'Bash', command: 'python3 call.py --prompt "a private prompt"', tool_use_id: 'toolu_1' } as any)
+  expect(r.text).toContain('THE SECRET REPLY') // the tool's answer goes on untouched
+  expect(autoFiles(files)).toEqual([AUTO])
+  const [rec, ...more] = linesOf(files[AUTO])
+  expect(more.length).toBe(0)
+  expect(rec).toEqual({ ts: NOW, session: 'me', provider: 'openai', model: 'gpt-5-2025-08-07', usage: { prompt_tokens: 120, completion_tokens: 30, total_tokens: 150, prompt_tokens_details: { cached_tokens: 20 } }, note: 'auto: Bash', auto: true, call: 'toolu_1' })
+  const raw = files[AUTO]
+  for (const secret of ['THE SECRET REPLY', 'chatcmpl-secret-id', 'a private prompt', 'call.py']) expect(raw).not.toContain(secret)
+  // and the ledger reads it back like any other line
+  expect(summarize(parse(raw).recs, null).rows[0]).toMatchObject({ key: 'openai/gpt-5-2025-08-07', calls: 1, input: 100, cached: 20, output: 30 })
+})
+
+// No double counting: the command may have logged the call itself (tu-log) and also printed the usage.
+test('a call the command already logged with tu-log is not logged again', async ($, on) => {
+  const text = openai()
+  const tuLog = (over: object = {}) => JSON.stringify({ ts: NOW - 1000, session: 'me', provider: 'openai', model: 'gpt-5-2025-08-07', usage: { prompt_tokens: 120, completion_tokens: 30, prompt_tokens_details: { cached_tokens: 20 } }, ...over })
+  // same session, same numbers, a moment before the command ended: one call
+  let files = rig($, on, { [DAYFILE]: tuLog() + '\n' }, { text })
+  await $.tool.call({ tool: 'Bash', command: 'python3 call.py' } as any)
+  expect(autoFiles(files)).toEqual([])
+  // a bare tu-log line (no model, no provider) is the same call too
+  files[DAYFILE] = tuLog({ model: undefined, provider: undefined }) + '\n'
+  await $.tool.call({ tool: 'Bash', command: 'python3 call.py' } as any)
+  expect(autoFiles(files)).toEqual([])
+  // not the same call: other numbers, another session, another model, or logged long before the command ran
+  for (const over of [{ usage: { prompt_tokens: 121, completion_tokens: 30, prompt_tokens_details: { cached_tokens: 20 } } }, { session: 'someone-else' }, { model: 'gpt-4o' }, { ts: NOW - 60_000 }]) {
+    for (const k of autoFiles(files)) delete files[k]
+    files[DAYFILE] = tuLog(over) + '\n'
+    await $.tool.call({ tool: 'Bash', command: 'python3 call.py' } as any)
+    expect(autoFiles(files)).toEqual([AUTO])
+  }
+})
+
+test('alreadyLogged: the window, the session, the numbers and the model all have to agree', async () => {
+  const [f] = findUsages(openai())
+  const rec = { ts: 1000, session: 's', model: 'gpt-5', usage: { prompt_tokens: 120, completion_tokens: 30, prompt_tokens_details: { cached_tokens: 20 } } }
+  expect(alreadyLogged(f, [rec], 's', 900, 1100)).toBe(true) // a dated snapshot id and the bare model are the same model
+  expect(alreadyLogged(f, [rec], 's', 1001, 1100)).toBe(false)
+  expect(alreadyLogged(f, [rec], 'other', 900, 1100)).toBe(false)
+  expect(alreadyLogged(f, [{ ...rec, model: 'gpt-4o' }], 's', 900, 1100)).toBe(false)
+  expect(alreadyLogged(f, [{ ...rec, usage: { prompt_tokens: 1, completion_tokens: 1 } }], 's', 900, 1100)).toBe(false)
+})
+
+test('the same numbers printed twice in one output are one call; two different calls are two', async ($, on) => {
+  const once = openai()
+  const out: any = { text: `${once}\nusage again: ${JSON.stringify({ usage: JSON.parse(once).usage, model: 'gpt-5-2025-08-07' })}` }
+  const files = rig($, on, {}, out)
+  await $.tool.call({ tool: 'Bash', command: 'python3 call.py' } as any)
+  expect(linesOf(files[AUTO]).length).toBe(1)
+  delete files[AUTO]
+  out.text = `${once}\n${openai({ usage: { prompt_tokens: 7, completion_tokens: 3 } })}`
+  await $.tool.call({ tool: 'Bash', command: 'python3 call.py' } as any)
+  expect(linesOf(files[AUTO]).map(r => r.usage.prompt_tokens)).toEqual([120, 7])
+})
+
+test('what is not a new API call is not logged', async ($, on) => {
+  const out: any = { text: '' }
+  const files = rig($, on, {}, out)
+  const ledgerLine = JSON.stringify({ ts: NOW, session: 'me', provider: 'openai', model: 'gpt-5', usage: { prompt_tokens: 5, completion_tokens: 5 } })
+  const cases: [string, string, string][] = [
+    ['a file shown with cat', 'cat notes.md', openai()],
+    ['a git diff', 'git diff HEAD~1 -- docs', openai()],
+    ['a pipe of viewers', 'cd docs && grep -n usage README.md | head -5', openai()],
+    ['the ledger itself', 'python3 show_ledger.py', ledgerLine + '\n' + ledgerLine],
+    ['the generic {input, output} pair', 'python3 bench.py', JSON.stringify({ model: 'x', usage: { input: 5, output: 6 } })],
+    ['a Python repr', 'python3 call.py', "{'model': 'gpt-5', 'usage': {'prompt_tokens': 5, 'completion_tokens': 6}}"],
+    ['truncated JSON', 'python3 call.py', openai().slice(0, 150)],
+    ['output with no usage', 'python3 call.py', JSON.stringify({ model: 'gpt-5', choices: [] }) + ' tokens'],
+    ['zero tokens', 'python3 call.py', JSON.stringify({ usage: { prompt_tokens: 0, completion_tokens: 0 } })],
+  ]
+  for (const [why, command, text] of cases) {
+    out.text = text
+    await $.tool.call({ tool: 'Bash', command } as any)
+    expect([why, autoFiles(files)]).toEqual([why, []])
+  }
+  // a denied call has no output to read; the switch turns the whole thing off
+  out.text = openai()
+  out.deny = 'blocked'
+  await $.tool.call({ tool: 'Bash', command: 'python3 call.py' } as any)
+  out.deny = undefined
+  out.env = { TOKEN_USAGE_AUTO: 'off' }
+  await $.tool.call({ tool: 'Bash', command: 'python3 call.py' } as any)
+  expect(autoFiles(files)).toEqual([])
+  // a tool that is neither Bash nor MCP is never looked at
+  out.env = {}
+  await $.tool.call({ tool: 'Read', file_path: '/x' } as any)
+  expect(autoFiles(files)).toEqual([])
+  // and with the switch back on the very same call is logged
+  await $.tool.call({ tool: 'Bash', command: 'python3 call.py' } as any)
+  expect(autoFiles(files)).toEqual([AUTO])
+})
+
+test('an MCP tool that returns a Gemini response is logged under its own name; Gemini gets no provider', async ($, on) => {
+  const gemini = JSON.stringify({ candidates: [{ content: { parts: [{ text: 'SECRET' }] } }], usageMetadata: { promptTokenCount: 1000, candidatesTokenCount: 50, thoughtsTokenCount: 10, promptTokensDetails: [{ modality: 'TEXT', tokenCount: 1000 }] }, modelVersion: 'gemini-2.5-flash', responseId: 'abc' })
+  const files = rig($, on, {}, { text: gemini })
+  await $.tool.call({ tool: 'mcp__vertex__generate', prompt: 'hi', tool_use_id: 'toolu_2' } as any)
+  const [rec] = linesOf(files[AUTO])
+  expect(rec).toEqual({ ts: NOW, session: 'me', model: 'gemini-2.5-flash', usage: { promptTokenCount: 1000, candidatesTokenCount: 50, thoughtsTokenCount: 10 }, note: 'auto: mcp__vertex__generate', auto: true, call: 'toolu_2' })
+  expect(files[AUTO]).not.toContain('SECRET')
+})
+
+test('Gemini CLI stats give one line per model', async ($, on) => {
+  const stats = JSON.stringify({ response: 'SECRET', stats: { models: { 'gemini-2.5-pro': { api: { totalRequests: 1 }, tokens: { input: 8044, prompt: 8044, candidates: 367, total: 8448, cached: 0, thoughts: 37, tool: 0 } }, 'gemini-2.5-flash-lite': { tokens: { input: 100, prompt: 100, candidates: 5, total: 105, cached: 0, thoughts: 0, tool: 0 } } } } })
+  const files = rig($, on, {}, { text: stats })
+  await $.tool.call({ tool: 'Bash', command: 'gemini -p "x" --output-format json' } as any)
+  expect(linesOf(files[AUTO]).map(r => [r.model, r.usage.candidates])).toEqual([['gemini-2.5-pro', 367], ['gemini-2.5-flash-lite', 5]])
+  expect(files[AUTO]).not.toContain('SECRET')
+})
+
+test('a call that failed after printing its usage still spent the tokens', async ($, on) => {
+  const files = rig($, on, {}, { text: openai() + '\nTraceback: connection reset', isError: true })
+  await $.tool.call({ tool: 'Bash', command: 'python3 call.py' } as any)
+  expect(linesOf(files[AUTO]).length).toBe(1)
+})
+
+test('calls that finish together are all logged; the same call is never logged twice', async ($, on) => {
+  // parallel tool calls: each prints its own numbers, told apart by tool_use_id
+  const files = rig($, on, {}, { text: (e: any) => openai({ usage: { prompt_tokens: Number(String(e.tool_use_id).slice(1)), completion_tokens: 1 } }) })
+  await Promise.all([1, 2, 3].map(n => $.tool.call({ tool: 'Bash', command: 'python3 call.py', tool_use_id: `t${n}` } as any)))
+  expect(linesOf(files[AUTO]).map(r => r.usage.prompt_tokens).sort()).toEqual([1, 2, 3])
+  // the same tool call seen again (a replay) adds nothing
+  await $.tool.call({ tool: 'Bash', command: 'python3 call.py', tool_use_id: 't2' } as any)
+  expect(linesOf(files[AUTO]).length).toBe(3)
+})
+
+test('a capture file that exists but cannot be read is left alone, not overwritten', async ($, on) => {
+  const out: any = { text: openai(), unreadable: AUTO }
+  const files = rig($, on, { [AUTO]: '{"ts":1,"usage":{"input":1,"output":1}}\n' }, out)
+  const before = files[AUTO]
+  await $.tool.call({ tool: 'Bash', command: 'python3 call.py' } as any)
+  expect(files[AUTO]).toBe(before)
+  // readable again, but the last line has no newline: the new line is not glued to it
+  out.unreadable = undefined
+  files[AUTO] = '{"ts":1,"session":"me","usage":{"input_tokens":1,"output_tokens":1}}'
+  await $.tool.call({ tool: 'Bash', command: 'python3 call.py' } as any)
+  expect(linesOf(files[AUTO]).length).toBe(2)
+})
+
+test('/usage-ext reads the capture files and says how many lines were logged automatically', async ($, on) => {
+  const files = rig($, on, {}, { text: openai() })
+  on('session.usage', async () => ({ value: { startedAt: NOW - 60_000, context: { window: 1_000_000 }, rateLimits: [] } }))
+  on('fs.list', async () => ({ value: Object.keys(files).map(k => ({ name: k.split('/').pop(), kind: 'file', size: 1, mtimeMs: 0, isLink: false })) }))
+  files[DAYFILE] = JSON.stringify({ ts: NOW - 300_000, session: 'me', model: 'tu-logged', usage: { input: 1, output: 1 } }) + '\n'
+  await $.tool.call({ tool: 'Bash', command: 'python3 call.py' } as any)
+  const { text } = await $.command.run({ command: 'usage-ext', args: '' } as any)
+  expect(text).toContain('openai/gpt-5-2025-08-07 · 1 次')
+  expect(text).toContain('tu-logged · 1 次')
+  expect(text).toContain('其中 1 条是从 Bash / MCP 工具的输出里自动记下的')
+  expect(text).toContain('TOKEN_USAGE_AUTO=off')
+})
+
+// ---- reading usage out of text ----
+
+test('findUsages: the wire formats providers send, wherever they sit in the text', async () => {
+  const one = (text: string) => findUsages(text).map(f => ({ model: f.model, provider: f.provider, ...f.tok }))
+  // Anthropic message: model beside the usage; the vendor follows from a claude-* id
+  expect(one('{"type":"message","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":300,"cache_creation_input_tokens":40,"cache_creation":{"ephemeral_5m_input_tokens":10,"ephemeral_1h_input_tokens":30}}}'))
+    .toEqual([{ model: 'claude-sonnet-4-5-20250929', provider: 'anthropic', input: 10, cached: 300, cacheWrite: 10, cacheWrite1h: 30, output: 20, thinking: 0 }])
+  // OpenAI Responses inside an event, in a log line
+  expect(one('2026-10-28 INFO event=' + JSON.stringify({ type: 'response.completed', response: { model: 'gpt-5.5', usage: { input_tokens: 500, output_tokens: 200, input_tokens_details: { cached_tokens: 100 }, output_tokens_details: { reasoning_tokens: 60 } } } }) + ' ok'))
+    .toEqual([{ model: 'gpt-5.5', provider: 'openai', input: 400, cached: 100, cacheWrite: 0, cacheWrite1h: 0, output: 140, thinking: 60 }])
+  // Ollama: the counts sit beside the reply, in the reply object itself
+  expect(one('{"model":"llama3.2","response":"hi","done":true,"prompt_eval_count":26,"eval_count":298}')).toEqual([{ model: 'llama3.2', provider: 'ollama', input: 26, cached: 0, cacheWrite: 0, cacheWrite1h: 0, output: 298, thinking: 0 }])
+  // a script that printed only the usage object: no model, no provider
+  expect(one('usage -> {"promptTokenCount": 9, "candidatesTokenCount": 3}')).toEqual([{ model: undefined, provider: undefined, input: 9, cached: 0, cacheWrite: 0, cacheWrite1h: 0, output: 3, thinking: 0 }])
+  // JSON lines, and a list of responses: each is found
+  expect(findUsages(['{"model":"m","usage":{"prompt_tokens":1,"completion_tokens":1}}', 'text', '[{"usage":{"prompt_tokens":2,"completion_tokens":2}}]'].join('\n')).length).toBe(2)
+  // a model id that is free text is not kept as a model
+  expect(findUsages('{"model":"a long sentence that is not an id","usage":{"prompt_tokens":1,"completion_tokens":1}}')[0].model).toBeUndefined()
+  // braces in strings do not confuse the scan; an unbalanced brace before real JSON does not hide it
+  expect(findUsages('{ oops "{" ... ' + '{"note":"}{","usage":{"prompt_tokens":4,"completion_tokens":4}}').length).toBe(1)
+  expect(findUsages('')).toEqual([])
+  expect(findUsages('{'.repeat(50_000)).length).toBe(0)
+})
+
+test('onlyViews: commands that only show files or text', async () => {
+  for (const c of ['cat a.json', 'head -n 5 a.json | jq .', 'git log -p -3', 'cd x && ls -la && rg usage .', 'FOO=1 sed -n 1,5p /tmp/a', '/usr/bin/cat a', 'sudo cat /etc/hosts']) expect([c, onlyViews(c)]).toEqual([c, true])
+  for (const c of ['python3 call.py', 'curl -s https://api.openai.com/v1/chat/completions | jq .', 'gemini -p hi', 'cat $(python3 call.py)', 'echo `python3 call.py`', 'git push', 'cat a && python3 call.py', 'bash -c "cat a"', '']) expect([c, onlyViews(c)]).toEqual([c, false])
 })

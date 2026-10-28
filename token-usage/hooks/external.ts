@@ -6,7 +6,7 @@
 // table (the one shipped with the mod, prices.default.json, overlaid by the user's own prices.json), and
 // sums them. Pure functions: the reading and the drawing of the answer live in register.tsx.
 
-export type Rec = { ts: number; session?: string; provider?: string; model?: string; usage: any; note?: string }
+export type Rec = { ts: number; session?: string; provider?: string; model?: string; usage: any; note?: string; auto?: boolean; call?: string }
 export type Tok = { input: number; cached: number; cacheWrite: number; cacheWrite1h: number; output: number; thinking: number }
 type RateKey = 'input' | 'output' | 'cached' | 'cacheWrite' | 'cacheWrite1h' | 'thinking'
 type Rate = Partial<Record<RateKey, number | null>>
@@ -32,14 +32,15 @@ const unwrap = (raw: any) => {
   return raw
 }
 
-// What each provider reports, as four kinds of tokens that are priced differently:
+// What each provider reports, as the kinds of tokens that are priced differently:
 //   input      new prompt tokens at the full input price (cache hits excluded)
 //   cached     prompt tokens served from the provider's cache
 //   cacheWrite prompt tokens written to a cache (Anthropic-style, priced above input); Anthropic's
 //              1-hour writes (cache_creation.ephemeral_1h_input_tokens) are cacheWrite1h, priced above the 5-minute ones
 //   output     reply tokens, thinking apart; thinking is priced as output unless the table says otherwise
-export const normalize = (raw: unknown): Tok | null => {
-  const u: any = unwrap(raw)
+// `shape` says which wire format matched: capturing from tool output (below) trusts only the provider ones.
+export type Shape = 'gemini' | 'gemini-cli' | 'openai-chat' | 'responses' | 'anthropic' | 'tokens' | 'ollama' | 'own'
+export const readUsage = (u: any): { tok: Tok; shape: Shape } | null => {
   if (!u || typeof u !== 'object') return null
   const tok = (t: Partial<Tok>): Tok => ({ input: 0, cached: 0, cacheWrite: 0, cacheWrite1h: 0, output: 0, thinking: 0, ...t })
 
@@ -47,24 +48,27 @@ export const normalize = (raw: unknown): Tok | null => {
   if (has(u, 'promptTokenCount', 'prompt_token_count', 'candidatesTokenCount', 'candidates_token_count')) {
     const cached = pick(u, 'cachedContentTokenCount', 'cached_content_token_count')
     const prompt = pick(u, 'promptTokenCount', 'prompt_token_count')
-    return tok({
-      input: Math.max(0, prompt - cached) + pick(u, 'toolUsePromptTokenCount', 'tool_use_prompt_token_count'),
-      cached,
-      output: pick(u, 'candidatesTokenCount', 'candidates_token_count'),
-      thinking: pick(u, 'thoughtsTokenCount', 'thoughts_token_count'),
-    })
+    return {
+      shape: 'gemini',
+      tok: tok({
+        input: Math.max(0, prompt - cached) + pick(u, 'toolUsePromptTokenCount', 'tool_use_prompt_token_count'),
+        cached,
+        output: pick(u, 'candidatesTokenCount', 'candidates_token_count'),
+        thinking: pick(u, 'thoughtsTokenCount', 'thoughts_token_count'),
+      }),
+    }
   }
   // Gemini CLI stats.models[m].tokens: `input` is already the prompt less the cached part
   if (has(u, 'candidates', 'thoughts')) {
     const cached = pick(u, 'cached')
     const input = has(u, 'input') ? pick(u, 'input') : Math.max(0, pick(u, 'prompt') - cached)
-    return tok({ input: input + pick(u, 'tool'), cached, output: pick(u, 'candidates'), thinking: pick(u, 'thoughts') })
+    return { shape: 'gemini-cli', tok: tok({ input: input + pick(u, 'tool'), cached, output: pick(u, 'candidates'), thinking: pick(u, 'thoughts') }) }
   }
   // OpenAI chat completions, OpenRouter, Groq: reasoning tokens are counted inside completion_tokens
   if (has(u, 'prompt_tokens', 'completion_tokens')) {
     const cached = num(u.prompt_tokens_details?.cached_tokens)
     const think = num(u.completion_tokens_details?.reasoning_tokens)
-    return tok({ input: Math.max(0, pick(u, 'prompt_tokens') - cached), cached, output: Math.max(0, pick(u, 'completion_tokens') - think), thinking: think })
+    return { shape: 'openai-chat', tok: tok({ input: Math.max(0, pick(u, 'prompt_tokens') - cached), cached, output: Math.max(0, pick(u, 'completion_tokens') - think), thinking: think }) }
   }
   if (has(u, 'input_tokens', 'output_tokens')) {
     // Anthropic: input_tokens is only the uncached part, cache reads and writes are separate. cache_creation_input_tokens
@@ -74,24 +78,26 @@ export const normalize = (raw: unknown): Tok | null => {
       const w1h = cc ? num(cc.ephemeral_1h_input_tokens) : 0
       const write = has(u, 'cache_creation_input_tokens') ? pick(u, 'cache_creation_input_tokens') : cc ? num(cc.ephemeral_5m_input_tokens) + w1h : 0
       const long = Math.min(write, w1h)
-      return tok({ input: pick(u, 'input_tokens'), cached: pick(u, 'cache_read_input_tokens'), cacheWrite: write - long, cacheWrite1h: long, output: pick(u, 'output_tokens') })
+      return { shape: 'anthropic', tok: tok({ input: pick(u, 'input_tokens'), cached: pick(u, 'cache_read_input_tokens'), cacheWrite: write - long, cacheWrite1h: long, output: pick(u, 'output_tokens') }) }
     }
     // OpenAI Responses API: details nested, cached inside input_tokens, reasoning inside output_tokens
     if (u.input_tokens_details || u.output_tokens_details) {
       const cached = num(u.input_tokens_details?.cached_tokens)
       const think = num(u.output_tokens_details?.reasoning_tokens)
-      return tok({ input: Math.max(0, pick(u, 'input_tokens') - cached), cached, output: Math.max(0, pick(u, 'output_tokens') - think), thinking: think })
+      return { shape: 'responses', tok: tok({ input: Math.max(0, pick(u, 'input_tokens') - cached), cached, output: Math.max(0, pick(u, 'output_tokens') - think), thinking: think }) }
     }
-    return tok({ input: pick(u, 'input_tokens'), output: pick(u, 'output_tokens') })
+    return { shape: 'tokens', tok: tok({ input: pick(u, 'input_tokens'), output: pick(u, 'output_tokens') }) }
   }
   // Ollama
-  if (has(u, 'prompt_eval_count', 'eval_count')) return tok({ input: pick(u, 'prompt_eval_count'), output: pick(u, 'eval_count') })
+  if (has(u, 'prompt_eval_count', 'eval_count')) return { shape: 'ollama', tok: tok({ input: pick(u, 'prompt_eval_count'), output: pick(u, 'eval_count') }) }
   // already in this module's own terms
   if (has(u, 'input', 'output')) {
-    return tok({ input: pick(u, 'input'), cached: pick(u, 'cached'), cacheWrite: pick(u, 'cacheWrite'), cacheWrite1h: pick(u, 'cacheWrite1h'), output: pick(u, 'output'), thinking: pick(u, 'thinking') })
+    return { shape: 'own', tok: tok({ input: pick(u, 'input'), cached: pick(u, 'cached'), cacheWrite: pick(u, 'cacheWrite'), cacheWrite1h: pick(u, 'cacheWrite1h'), output: pick(u, 'output'), thinking: pick(u, 'thinking') }) }
   }
   return null
 }
+
+export const normalize = (raw: unknown): Tok | null => readUsage(unwrap(raw))?.tok ?? null
 
 // ---- prices ----
 
@@ -216,7 +222,7 @@ export const parseArgs = (args: string): { scope: Scope; json: boolean } => {
 }
 
 const DAY = 86_400_000
-const ymd = (ms: number) => {
+export const ymd = (ms: number) => {
   const d = new Date(ms)
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 }
@@ -224,15 +230,18 @@ const midnight = (ms: number) => {
   const d = new Date(ms)
   return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime()
 }
-const MAX_FILES = 400
+const MAX_FILES = 1000
 
 // where a scope begins, in ms; a session has no start of its own here, it is matched by id
 const sinceOf = (scope: Scope, now: number) =>
   scope === 'today' ? midnight(now) : typeof scope === 'object' ? now - scope.days * DAY : 0
 
-// the day files that can hold the scope (one day of slack each way: files are named by the caller's local date)
+// the day files that can hold the scope (one day of slack each way: files are named by the caller's local date).
+// `YYYY-MM-DD.jsonl` is for callers (tu-log, your own lines); `YYYY-MM-DD.auto-<session>.jsonl` is what this mod
+// itself writes from tool output, one file per session so it never rewrites a file somebody else is appending to.
+const LEDGER_FILE = /^\d{4}-\d{2}-\d{2}(\.[A-Za-z0-9_-]+)?\.jsonl$/
 export const pickFiles = (names: string[], scope: Scope, now: number, sessionStart: number) => {
-  const days = names.filter(n => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(n)).sort()
+  const days = names.filter(n => LEDGER_FILE.test(n)).sort()
   const from = scope === 'all' ? '' : ymd((scope === 'session' ? sessionStart : sinceOf(scope, now)) - DAY)
   return days.filter(n => n.slice(0, 10) >= from).slice(-MAX_FILES)
 }
@@ -257,12 +266,14 @@ export const summarize = (recs: Rec[], prices: Prices | null) => {
   const by = new Map<string, Row>()
   const total = zero('合计')
   let unrecognized = 0
+  let auto = 0
   for (const r of recs) {
     const t = normalize(r.usage)
     if (!t) {
       unrecognized++
       continue
     }
+    if (r.auto) auto++
     const p = priceOf(prices, r)
     const c = cost(t, p, prices?.per, r.ts)
     const key = keyOf(r)
@@ -273,8 +284,174 @@ export const summarize = (recs: Rec[], prices: Prices | null) => {
     addTo(total, t, c)
   }
   const rows = [...by.values()].sort((a, b) => b.cost - a.cost || b.calls - a.calls)
-  return { rows, total, unrecognized }
+  return { rows, total, unrecognized, auto }
 }
+
+// ---- capturing usage from tool output ----
+// A Bash or MCP tool call that prints a provider's usage object is logged without anyone calling tu-log. Only complete
+// JSON is read (a Python repr, a truncated dump, a script that prints just the reply is not), only wire formats a
+// provider really sends are trusted (not the generic {input, output} pair), and only the numbers are kept.
+
+// JSON objects in a text, outermost first: the text may be one whole response, JSON lines, or a log with JSON in it.
+// Scanning is bounded: a text full of unbalanced braces cannot make this slow.
+const SCAN_BUDGET = 20_000_000
+const objectsIn = (text: string): any[] => {
+  const out: any[] = []
+  let at = 0
+  let work = 0
+  while (at < text.length && work < SCAN_BUDGET) {
+    const start = text.indexOf('{', at)
+    if (start < 0) break
+    let depth = 0
+    let inStr = false
+    let end = -1
+    for (let i = start; i < text.length && work < SCAN_BUDGET; i++, work++) {
+      const c = text[i]
+      if (inStr) {
+        if (c === '\\') i++
+        else if (c === '"') inStr = false
+      } else if (c === '"') inStr = true
+      else if (c === '{') depth++
+      else if (c === '}' && --depth === 0) {
+        end = i + 1
+        break
+      }
+    }
+    if (end > 0) {
+      try {
+        out.push(JSON.parse(text.slice(start, end)))
+        at = end
+        continue
+      } catch {}
+    }
+    at = start + 1
+  }
+  return out
+}
+
+// keep numbers and the dicts that hold them: nothing a prompt or a reply could be in (what tu-log keeps)
+const numbersOnly = (o: any): Record<string, any> => {
+  const out: Record<string, any> = {}
+  for (const [k, v] of Object.entries(o)) {
+    if (typeof v === 'number' && Number.isFinite(v)) out[k] = v
+    else if (v && typeof v === 'object' && !Array.isArray(v)) {
+      const sub = numbersOnly(v)
+      if (Object.keys(sub).length) out[k] = sub
+    }
+  }
+  return out
+}
+
+export type Found = { usage: Record<string, any>; tok: Tok; shape: Shape; model?: string; provider?: string }
+
+const WRAPPERS = ['usageMetadata', 'usage_metadata', 'usage']
+const TRUSTED: Shape[] = ['gemini', 'openai-chat', 'responses', 'anthropic', 'tokens', 'ollama']
+const MAX_PER_CALL = 100
+// a model id looks like one (never free text that could be a reply)
+const idLike = (x: unknown) => (typeof x === 'string' && x.length <= 128 && /^[\w.:@/-]+$/.test(x) ? x : undefined)
+const total = (t: Tok) => t.input + t.cached + t.cacheWrite + t.cacheWrite1h + t.output + t.thinking
+
+// The vendor, when the output tells: Ollama's own reply shape, or a model id that names its maker. Gemini calls get none:
+// the Gemini API and Vertex AI print the same shape, and OpenAI-shaped output comes from many servers.
+const providerOf = (shape: Shape, model?: string) => {
+  if (shape === 'ollama') return 'ollama'
+  if (!model || model.includes('/')) return undefined
+  if (/^claude-/.test(model)) return 'anthropic'
+  if (/^(gpt-|o\d|chatgpt|chat-latest)/.test(model)) return 'openai'
+  return undefined
+}
+
+// Usage objects in a tool's output text, each once. Where an output holds the same numbers for the same model twice
+// (the response printed and then its usage again), that is one call.
+export const findUsages = (text: string): Found[] => {
+  const out: Found[] = []
+  const seen = new Set<string>()
+  const add = (u: any, model: string | undefined, r: { tok: Tok; shape: Shape }) => {
+    if (total(r.tok) <= 0) return
+    const usage = numbersOnly(u)
+    const key = JSON.stringify([model ?? '', r.tok])
+    if (seen.has(key)) return
+    seen.add(key)
+    out.push({ usage, tok: r.tok, shape: r.shape, model, provider: providerOf(r.shape, model) })
+  }
+  const walk = (node: any, model: string | undefined, depth: number) => {
+    if (!node || typeof node !== 'object' || depth > 10 || out.length >= MAX_PER_CALL) return
+    if (Array.isArray(node)) {
+      for (const x of node) walk(x, model, depth + 1)
+      return
+    }
+    // a ledger line (this mod's own file, or tu-log's) is not an API response: reading the ledger must not log it again
+    if (typeof node.ts === 'number' && node.usage && typeof node.usage === 'object') return
+    const m = idLike(node.modelVersion) ?? idLike(node.model_version) ?? idLike(node.model) ?? model
+    const taken = new Set<string>()
+    // Gemini CLI: stats.models[name].tokens, one usage per model
+    const models = node.stats?.models
+    if (models && typeof models === 'object' && !Array.isArray(models)) {
+      taken.add('stats')
+      for (const [name, v] of Object.entries<any>(models)) {
+        const t = v?.tokens
+        const r = t && typeof t === 'object' ? readUsage(t) : null
+        if (r && r.shape === 'gemini-cli') add(t, idLike(name), r)
+      }
+    }
+    for (const k of WRAPPERS) {
+      const u = node[k]
+      const r = u && typeof u === 'object' && !Array.isArray(u) ? readUsage(u) : null
+      if (r && TRUSTED.includes(r.shape)) {
+        add(u, m, r)
+        taken.add(k)
+      }
+    }
+    // the node is itself a usage object (a script printed only that), or Ollama's reply with the counts beside the text
+    if (!taken.size) {
+      const r = readUsage(node)
+      if (r && TRUSTED.includes(r.shape)) {
+        add(node, m, r)
+        return
+      }
+    }
+    for (const [k, v] of Object.entries(node)) if (!taken.has(k) && v && typeof v === 'object') walk(v, m, depth + 1)
+  }
+  for (const o of objectsIn(text)) walk(o, undefined, 0)
+  return out
+}
+
+// A Bash command that only looks at files or text cannot have called an API; what it prints is somebody's document,
+// transcript or earlier response, not a new call. Anything with a command substitution, or any other program, is not.
+const VIEWERS = new Set(['cat', 'head', 'tail', 'less', 'more', 'grep', 'egrep', 'fgrep', 'rg', 'ag', 'sed', 'awk', 'bat', 'nl', 'tac', 'cut', 'sort', 'uniq', 'wc', 'diff', 'jq', 'ls', 'find', 'cd', 'echo', 'printf', 'xxd', 'od', 'strings', 'tr', 'column', 'file', 'stat', 'pwd', 'true', 'test', 'tee', 'date', 'which'])
+const GIT_VIEWS = new Set(['show', 'diff', 'log', 'blame', 'grep', 'status', 'ls-files', 'cat-file', 'branch'])
+export const onlyViews = (command: string) => {
+  if (/\$\(|`/.test(command)) return false
+  const segments = command.split(/&&|\|\||;|\||\n/).map(x => x.trim()).filter(Boolean)
+  if (!segments.length) return false
+  return segments.every(seg => {
+    const words = seg.replace(/^(\w+=\S*\s+)+/, '').split(/\s+/)
+    while (words[0] === 'sudo' || words[0] === 'time' || words[0] === 'command') words.shift()
+    const name = (words[0] ?? '').split('/').pop() ?? ''
+    return name === 'git' ? GIT_VIEWS.has(words[1] ?? '') : VIEWERS.has(name)
+  })
+}
+
+// is this tool call's usage already in the ledger? tu-log (or a line by hand) may have logged the same call from inside
+// the command, between `from` and `to`: same session, same numbers, a model that does not contradict.
+const modelsAgree = (a?: string, b?: string) => {
+  if (!a || !b) return true
+  const fb = idForms(b)
+  return idForms(a).some(x => fb.includes(x))
+}
+export const sameTok = (a: Tok, b: Tok) => a.input === b.input && a.cached === b.cached && a.cacheWrite === b.cacheWrite && a.cacheWrite1h === b.cacheWrite1h && a.output === b.output && a.thinking === b.thinking
+export const alreadyLogged = (f: Found, recs: Rec[], session: string, from: number, to: number) =>
+  recs.some(r => {
+    if (r.session !== undefined && r.session !== session) return false
+    if (typeof r.ts !== 'number' || r.ts < from || r.ts > to) return false
+    const t = normalize(r.usage)
+    return !!t && sameTok(t, f.tok) && modelsAgree(f.model, r.model ?? undefined)
+  })
+
+// the ledger line for a capture: the numbers, the model and provider if the output carried them, which tool
+// printed it (its name, never its arguments or its output), and the call id so the same call is never logged twice
+export const captureLine = (f: Found, o: { ts: number; session: string; tool: string; call?: string }) =>
+  JSON.stringify({ ts: o.ts, session: o.session, provider: f.provider, model: f.model, usage: f.usage, note: `auto: ${o.tool}`, auto: true, call: o.call })
 
 // ---- the answer ----
 
@@ -307,6 +484,7 @@ export const render = (s: ReturnType<typeof summarize>, scope: Scope, n: Notes) 
   if (s.rows.length > 1) out.push(line(s.total))
   for (const r of s.rows) if (r.note) out.push(`${r.key} 的价格备注：${r.note}`)
   if (s.total.unpriced) out.push(`有 ${s.total.unpriced} 次调用没有价格，只统计了 token：${n.builtin ? '内置价格表' : '价格表'}里没有这个模型。把它的价格填进 ${n.dir}/prices.json${n.priced ? '' : '（文件不存在，参考 prices.example.json）'}`)
+  if (s.auto) out.push(`其中 ${s.auto} 条是从 Bash / MCP 工具的输出里自动记下的（只记数字；设 TOKEN_USAGE_AUTO=off 可关闭，见 README）`)
   if (s.unrecognized) out.push(`有 ${s.unrecognized} 条记录的 usage 认不出格式，已跳过`)
   if (n.bad) out.push(`有 ${n.bad} 行不是合法的账本记录，已跳过`)
   if (n.unreadable.length) out.push(`读不了的账本文件：${n.unreadable.join('、')}（超过 4 MiB 请按日拆分或归档）`)

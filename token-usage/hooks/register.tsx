@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
 import type { Snap, Win } from '../types'
-import { mergePrices, parse, parseArgs, pickFiles, render, select, summarize } from './external'
+import { alreadyLogged, captureLine, findUsages, mergePrices, normalize, onlyViews, parse, parseArgs, pickFiles, render, sameTok, select, summarize, ymd } from './external'
 import type { Rec } from './external'
 
 const EMPTY: Snap = { five: null, seven: null, usd: null, base: null, tokIn: 0, tokWrite: 0, tokOut: 0, tokCache: 0, sid: null, startedAt: null, since: null }
@@ -84,6 +84,63 @@ const usageExt = async ($: any, args: string) => {
   const date = builtin ? { updated: typeof builtin.updated === 'string' ? builtin.updated : undefined } : null
   if (json) return JSON.stringify({ scope, session: sid, ...sum, skippedLines: bad, unreadableFiles: unreadable, pricesLoaded: !!prices, builtinPrices: date && { ...date, sources: builtin.sources } }, null, 2)
   return render(sum, scope, { bad, unreadable, dir, priced: !!prices, builtin: date })
+}
+
+// ---- usage printed by a Bash / MCP tool call, logged to the same ledger without anyone calling tu-log ----
+// A call that prints a provider's usage object (findUsages in external.ts) gets one line in this session's own capture
+// file, ledger/YYYY-MM-DD.auto-<session>.jsonl. Its own file, because $.fs.write replaces a file whole: rewriting the day
+// file would drop a line tu-log appends at that moment. The day files are only read, to see whether the command already
+// logged the same call itself.
+let captureQueue: Promise<unknown> = Promise.resolve()
+// one writer at a time in this process: two tool calls finishing together would each write back the file as they read it
+const queued = <T,>(job: () => Promise<T>): Promise<T> => {
+  const run = captureQueue.then(job, job)
+  captureQueue = run.catch(() => {})
+  return run
+}
+const OFF = new Set(['off', '0', 'false', 'no'])
+const SLACK = 5000 // ms either side of the call for a line the command logged itself
+const readRecs = async ($: any, path: string): Promise<Rec[]> => {
+  try {
+    return parse((await $.fs.read(path)) as string).recs
+  } catch {
+    return []
+  }
+}
+
+const capture = async ($: any, e: any, r: any, t0: number) => {
+  if (!r || r.deny !== undefined || typeof r.text !== 'string' || r.text.length < 20) return
+  if (!/usage|token|eval_count/i.test(r.text)) return
+  if (e.tool === 'Bash' && onlyViews(String(e.command ?? ''))) return
+  const off = ((await $.env.get('TOKEN_USAGE_AUTO')) as string | undefined)?.trim().toLowerCase()
+  if (off && OFF.has(off)) return
+  const found = findUsages(r.text.slice(0, 1_000_000))
+  if (!found.length) return
+  const t1 = (await $.clock.now()) as number
+  const session = (await $.session.id()) as string
+  if (!session) return
+  const folder = `${await extDir($)}/ledger`
+  // lines the command itself logged (tu-log, or by hand) while it ran: the same call, not a second one
+  const others: Rec[] = []
+  for (const day of new Set([ymd(t0 - SLACK), ymd(t1 + SLACK)])) others.push(...(await readRecs($, `${folder}/${day}.jsonl`)))
+  const fresh = found.filter(f => !alreadyLogged(f, others, session, t0 - SLACK, t1 + SLACK))
+  if (!fresh.length) return
+  const file = `${folder}/${ymd(t1)}.auto-${session.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 64)}.jsonl`
+  await queued(async () => {
+    let text = ''
+    try {
+      text = (await $.fs.read(file)) as string
+    } catch {
+      // missing is fine; a file that exists but cannot be read is left alone rather than overwritten
+      if (await $.fs.exists(file)) return
+    }
+    const mine = parse(text).recs
+    const lines = fresh
+      .filter(f => !mine.some(x => e.tool_use_id && x.call === e.tool_use_id && sameTok(normalize(x.usage)!, f.tok)))
+      .map(f => captureLine(f, { ts: t1, session, tool: String(e.tool), call: e.tool_use_id }))
+    if (!lines.length) return
+    await $.fs.write(file, (text && !text.endsWith('\n') ? text + '\n' : text) + lines.join('\n') + '\n')
+  })
 }
 
 const hhmm = (ms: number) => {
@@ -259,6 +316,16 @@ export const register: Register = on => {
     } catch (err) {
       return { text: `usage-ext 失败：${err instanceof Error ? err.message : String(err)}` }
     }
+  })
+
+  // a Bash or MCP tool call that prints a provider's usage object is logged; the tool's result is passed on untouched
+  on('tool.call', { tool: /^(Bash|mcp__.+)$/ }, async ($, e, next) => {
+    const t0 = (await $.clock.now()) as number
+    const r = await next(e)
+    try {
+      await capture($, e, r, t0)
+    } catch {}
+    return r
   })
 
   // one count per API response, main loop and subagents alike
